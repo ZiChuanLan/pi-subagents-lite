@@ -1,8 +1,8 @@
 /**
- * pi-agents — A pi extension providing Claude Code-style autonomous sub-agents.
+ * pi-subagents-lite — autonomous child agents for Pi.
  *
  * Tools:
- *   Agent             — LLM-callable: spawn a sub-agent
+ *   subagent             — LLM-callable: spawn a sub-agent
  *   get_subagent_result  — LLM-callable: check background agent status/result
  *   steer_subagent       — LLM-callable: send a steering message to a running agent
  *
@@ -10,24 +10,18 @@
  *   /agents                 — Interactive agent management menu
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI, type ExtensionCommandContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
-import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveType, setDefaultsDisabled } from "./agent-types.js";
-import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
+import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, registerAgents, resolveType } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
-import { SubagentScheduler } from "./schedule.js";
-import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitProjectPatch } from "./settings.js";
 import { getStatusNote } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import {
@@ -48,7 +42,6 @@ import {
   type UICtx,
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
-import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
 
 // ---- Shared helpers ----
@@ -125,8 +118,8 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
 
 /**
  * Advertised thinking levels, ordered to mirror pi-ai's EXTENDED_THINKING_LEVELS
- * (`off` + every `ThinkingLevel`). Single source for the Agent tool description,
- * the generated-agent template, and the `/agents` wizard so these lists can't
+ * (`off` + every `ThinkingLevel`). Single source for the subagent tool description
+ * and the `/agents` UI so these lists cannot
  * drift behind pi again (#147). Availability of any level still depends on the
  * host pi version and the selected model — pi clamps unsupported levels down.
  */
@@ -282,7 +275,7 @@ export default function (pi: ExtensionAPI) {
 
   /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = () => {
-    const userAgents = loadCustomAgents(process.cwd());
+    const userAgents = loadCustomAgents(process.cwd(), loadSettings(process.cwd()).agents ?? {});
     registerAgents(userAgents);
   };
 
@@ -396,9 +389,13 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  // Background completion: route through group join or send individual nudge
+  // Background completion: route through group join or send individual nudge.
+  // The guard prevents child completions from touching a stale extension context
+  // after session replacement or shutdown.
+  let runtimeActive = true;
   const manager = new AgentManager((record) => {
-    // Emit lifecycle event based on terminal status
+    if (!runtimeActive || manager.getRecord(record.id) !== record) return;
+
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
     const eventData = buildEventData(record);
     if (isError) {
@@ -407,14 +404,6 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, type: record.type, description: record.description,
-      status: record.status, result: record.result, error: record.error,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-    });
-
-    // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
       agentActivity.delete(record.id);
       widget.markFinished(record.id);
@@ -423,29 +412,23 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // If this agent is pending batch finalization (debounce window still open),
-    // don't send an individual nudge — finalizeBatch will pick it up retroactively.
     if (currentBatchAgents.some(a => a.id === record.id)) {
       widget.update();
       return;
     }
 
     const result = groupJoin.onAgentComplete(record);
-    if (result === 'pass') {
-      sendIndividualNudge(record);
-    }
-    // 'held' → do nothing, group will fire later
-    // 'delivered' → group callback already fired
+    if (result === "pass") sendIndividualNudge(record);
     widget.update();
   }, undefined, (record) => {
-    // Emit started event when agent transitions to running (including from queue)
+    if (!runtimeActive || manager.getRecord(record.id) !== record) return;
     pi.events.emit("subagents:started", {
       id: record.id,
       type: record.type,
       description: record.description,
     });
   }, (record, info) => {
-    // Emit compacted event when agent's session compacts (preserves count on record).
+    if (!runtimeActive || manager.getRecord(record.id) !== record) return;
     pi.events.emit("subagents:compacted", {
       id: record.id,
       type: record.type,
@@ -456,113 +439,60 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  // Expose manager via Symbol.for() global registry for cross-package access.
-  // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
-  //
-  // Claim the slot only if it's free: subagent sessions re-activate this
-  // extension in the same process (session.bindExtensions in agent-runner.ts),
-  // and unconditionally overwriting would point the registry at a short-lived
-  // child manager — and the child's shutdown would then delete the root
-  // session's entry. The first activation (the root session) wins; child
-  // activations leave it alone.
+  // Minimal host lifecycle bridge. It exists solely so print/headless hosts can
+  // keep background children alive and perform teardown; it is not a spawn RPC.
   const MANAGER_KEY = Symbol.for("pi-subagents:manager");
-  const registryEntry = {
+  const managerHandle = {
     waitForAll: () => manager.waitForAll(),
     hasRunning: () => manager.hasRunning(),
-    spawn: (piRef: any, ctx: any, type: string, prompt: string, options: any) =>
-      manager.spawn(piRef, ctx, type, prompt, options),
     getRecord: (id: string) => manager.getRecord(id),
+    abort: (id: string) => manager.abort(id),
+    abortAll: () => manager.abortAll(),
   };
-  const ownsManagerRegistry = (globalThis as any)[MANAGER_KEY] === undefined;
-  if (ownsManagerRegistry) {
-    (globalThis as any)[MANAGER_KEY] = registryEntry;
-  }
+  const ownsManagerHandle = (globalThis as Record<symbol, unknown>)[MANAGER_KEY] === undefined;
+  if (ownsManagerHandle) (globalThis as Record<symbol, unknown>)[MANAGER_KEY] = managerHandle;
 
-  // --- Cross-extension RPC via pi.events ---
-  let currentCtx: ExtensionContext | undefined;
-  // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
-  // (a bound lifecycle event), not at factory time. pi runs every extension
-  // factory before the `extensions:` filter and only fires lifecycle events for
-  // survivors, so a child session that filtered pi-subagents out never reaches
-  // session_start — and must not advertise or answer RPC it can't service
-  // (currentCtx would stay undefined → spawn always "No active session"). Gating
-  // here makes a filtered session behave like an absent one (#142).
-  let rpcHandle: RpcHandle | undefined;
-
-  // ---- Subagent scheduler ----
-  // Session-scoped: store is constructed inside session_start once sessionId
-  // is available. Mirrors pi-chonky-tasks's session-scoped task store —
-  // schedules reset on /new, restore on /resume.
-  const scheduler = new SubagentScheduler();
-
-  function startScheduler(ctx: ExtensionContext) {
-    try {
-      const sessionId = ctx.sessionManager?.getSessionId?.();
-      if (!sessionId) return;  // sessionId not yet available — try again on next event
-      const path = resolveStorePath(ctx.cwd, sessionId);
-      const store = new ScheduleStore(path);
-      scheduler.start(pi, ctx, manager, store);
-      pi.events.emit("subagents:scheduler_ready", { sessionId, jobCount: store.list().length });
-    } catch (err) {
-      // Scheduling is non-essential — log and move on so the rest of the
-      // extension keeps working if e.g. .pi/ is unwritable.
-      console.warn("[pi-subagents] Failed to start scheduler:", err);
-    }
-  }
-
-  // Capture ctx from session_start for RPC spawn handler + start the scheduler.
-  // This also wires the RPC handlers and broadcasts readiness — on the first
-  // bound session_start, so a filtered-out activation never advertises (#142).
-  pi.on("session_start", async (_event, ctx) => {
-    currentCtx = ctx;
+  pi.on("session_start", () => {
+    runtimeActive = true;
     manager.clearCompleted(true);
-    // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
-    // fires once per activation, but a double-bind must not leak listeners.
-    if (!rpcHandle) {
-      rpcHandle = registerRpcHandlers({
-        events: pi.events,
-        pi,
-        getCtx: () => currentCtx,
-        manager,
-      });
-      // Broadcast readiness so extensions loaded alongside us can discover us.
-      // Emitting after all factories have run (rather than at factory time)
-      // also avoids the race where a consumer loaded after us misses the event.
-      pi.events.emit("subagents:ready", {});
-    }
-    if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
   });
 
   pi.on("session_before_switch", () => {
-    manager.clearCompleted(true);
-    scheduler.stop();
+    runtimeActive = false;
+    manager.reset();
+    for (const timer of pendingNudges.values()) clearTimeout(timer);
+    pendingNudges.clear();
+    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+    batchFinalizeTimer = undefined;
+    currentBatchAgents = [];
+    groupJoin.dispose();
+    agentActivity.clear();
+    widget.dispose();
+    fleet.dispose();
   });
 
-  // On shutdown, abort all agents immediately and clean up.
-  // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
-    rpcHandle?.unsubSpawn();
-    rpcHandle?.unsubStop();
-    rpcHandle?.unsubPing();
-    rpcHandle = undefined;
-    currentCtx = undefined;
-    // Only release the global slot if this activation claimed it — a child
-    // session's shutdown must not delete the root session's registry entry.
-    if (ownsManagerRegistry && (globalThis as any)[MANAGER_KEY] === registryEntry) {
-      delete (globalThis as any)[MANAGER_KEY];
-    }
-    scheduler.stop();
+    runtimeActive = false;
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
+    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+    batchFinalizeTimer = undefined;
+    currentBatchAgents = [];
+    groupJoin.dispose();
+    agentActivity.clear();
+    widget.dispose();
     fleet.dispose();
     manager.dispose();
+    if (ownsManagerHandle && (globalThis as Record<symbol, unknown>)[MANAGER_KEY] === managerHandle) {
+      delete (globalThis as Record<symbol, unknown>)[MANAGER_KEY];
+    }
   });
 
   // Live widget: show running agents above editor.
   // widgetMode (default "background") selects what the widget shows: "all" =
   // every agent; "background" = hide foreground (they already render inline as
-  // the Agent tool result, so showing them here too is a duplicate, #118), keep
+  // the subagent tool result, so showing them here too is a duplicate), keep
   // everything else; "off" = hide the widget entirely. Read live at render time.
   let widgetMode: WidgetMode = "background";
   function getWidgetMode(): WidgetMode { return widgetMode; }
@@ -576,8 +506,8 @@ export default function (pi: ExtensionAPI) {
   function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
 
   // Project/global default for writing the subagent .output transcript. A custom
-  // agent's `output_transcript` frontmatter overrides this per spawn; when the
-  // frontmatter is silent, this default applies. Read live at spawn time.
+  // agent JSON profile overrides this per spawn; legacy `output_transcript`
+  // frontmatter remains accepted. Read live at spawn time.
   let outputTranscriptDefault = true;
   function getOutputTranscriptDefault(): boolean { return outputTranscriptDefault; }
   function setOutputTranscript(b: boolean): void { outputTranscriptDefault = b; }
@@ -586,47 +516,6 @@ export default function (pi: ExtensionAPI) {
   let defaultJoinMode: JoinMode = 'smart';
   function getDefaultJoinMode(): JoinMode { return defaultJoinMode; }
   function setDefaultJoinMode(mode: JoinMode) { defaultJoinMode = mode; }
-
-  // Master switch for the schedule subagent feature. Defaults to enabled.
-  // Read once at extension init (before tool registration) so the Agent tool's
-  // param schema reflects the persisted setting. Runtime toggles via /agents
-  // → Settings short-circuit the menu entry + the execute-time addJob path
-  // immediately, but the schema-level removal only takes effect on next
-  // extension load (next pi session). Documented in CHANGELOG/README.
-  let schedulingEnabled = true;
-  function isSchedulingEnabled(): boolean { return schedulingEnabled; }
-  function setSchedulingEnabled(b: boolean) { schedulingEnabled = b; }
-
-  // ---- Scope models configuration ----
-  // When enabled, subagent model choices are validated against `enabledModels`
-  // from pi's settings — both global `<agentDir>/settings.json` and
-  // project-local `<cwd>/.pi/settings.json` (project overrides global).
-  // Off by default; opt-in via `/agents → Settings`. See docstring on
-  // SubagentsSettings.scopeModels for the hard-error vs warn-and-proceed
-  // policy and its rationale.
-  let scopeModelsEnabled = false;
-  function isScopeModelsEnabled(): boolean { return scopeModelsEnabled; }
-  function setScopeModelsEnabled(enabled: boolean): void { scopeModelsEnabled = enabled; }
-
-  // ---- Disable default agents configuration ----
-  // When enabled, the three hardcoded default agents (general-purpose, Explore,
-  // Plan) are not registered. User-defined agents from project/global custom
-  // agent dirs are completely unaffected — only DEFAULT_AGENTS are suppressed.
-  // Defaults to false; opt-in via `/agents → Settings` or subagents.json.
-  // State lives in agent-types.ts (isDefaultsDisabled) because registerAgents
-  // needs it; this wrapper just re-registers after flipping it.
-  function setDisableDefaultAgents(b: boolean): void {
-    setDefaultsDisabled(b);
-    reloadCustomAgents(); // re-register with new setting
-  }
-
-  // ---- Agent tool description mode ----
-  // "full" (default) keeps the rich Claude Code-style description; "compact"
-  // swaps in a ~75% smaller one for small/local models (#91). Read once at
-  // tool registration — flipping it applies on the next pi session.
-  let toolDescriptionMode: ToolDescriptionMode = "full";
-  function getToolDescriptionMode(): ToolDescriptionMode { return toolDescriptionMode; }
-  function setToolDescriptionMode(mode: ToolDescriptionMode): void { toolDescriptionMode = mode; }
 
   // ---- Batch tracking for smart join mode ----
   // Collects background agent IDs spawned in the current turn for smart grouping.
@@ -681,7 +570,8 @@ export default function (pi: ExtensionAPI) {
   /** Format an agent's tool scope: "*" when it has all built-ins, else a comma-separated list. */
   const formatToolsSuffix = (cfg: AgentConfig | undefined): string => {
     const tools = cfg?.builtinToolNames;
-    if (!tools || tools.length === 0) return "*";
+    if (tools === undefined) return "*";
+    if (tools.length === 0) return "none";
     const isFullSet =
       tools.length === BUILTIN_TOOL_NAMES.length
       && BUILTIN_TOOL_NAMES.every((t) => tools.includes(t));
@@ -700,19 +590,6 @@ export default function (pi: ExtensionAPI) {
     }).join("\n");
   };
 
-  /** First sentence of an agent description — for the compact type list. */
-  const firstSentence = (text: string): string => {
-    const match = text.match(/^.*?[.!?](?=\s|$)/s);
-    return (match ? match[0] : text).replace(/\s+/g, " ").trim();
-  };
-
-  /** Compact type list: one line per agent, first sentence only. */
-  const buildCompactTypeListText = () =>
-    getAvailableTypes().map((name) => {
-      const cfg = getAgentConfig(name);
-      return `- ${name}: ${firstSentence(cfg?.description ?? name)} (Tools: ${formatToolsSuffix(cfg)})`;
-    }).join("\n");
-
   /** Derive a short model label from a model string. */
   function getModelLabelFromConfig(model: string): string {
     // Strip provider prefix (e.g. "anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6")
@@ -721,163 +598,37 @@ export default function (pi: ExtensionAPI) {
     return name.replace(/-\d{8}$/, "");
   }
 
-  // Apply persisted settings on startup and emit `subagents:settings_loaded`.
-  // Global + project merged; missing → defaults; corrupt file emits a warning
-  // to stderr and falls back to defaults.
   applyAndEmitLoaded(
     {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
       setDefaultMaxTurns,
       setGraceTurns,
       setDefaultJoinMode,
-      setSchedulingEnabled,
-      setScopeModels: setScopeModelsEnabled,
-      setDisableDefaultAgents: setDisableDefaultAgents,
-      setToolDescriptionMode: setToolDescriptionMode,
       setFleetView: setFleetViewEnabled,
-      setWidgetMode: setWidgetMode,
-      setOutputTranscript: setOutputTranscript,
+      setWidgetMode,
+      setOutputTranscript,
     },
     (event, payload) => pi.events.emit(event, payload),
   );
+  reloadCustomAgents();
 
-  // ---- Agent tool ----
+  const subagentToolDescription = `Launch a child agent for complex, multi-step work.
 
-  // Schedule param + its guideline are gated on `schedulingEnabled` (read once
-  // at registration; flipping the setting later requires next pi session for
-  // the schema to update). Defining the shape once and spreading it via Partial
-  // preserves Type.Object's inference when present and produces a
-  // `schedule`-free schema when absent — zero LLM-context cost in disabled mode.
-  const scheduleParamShape = {
-    schedule: Type.Optional(
-      Type.String({
-        description:
-          'Opt-in only — fire later instead of now. Omit to run immediately (the default, almost always correct). ' +
-          'Formats: 6-field cron ("0 0 9 * * 1" = 9am Mon), interval ("5m"/"1h"), one-shot ("+10m" or ISO). ' +
-          'Forces run_in_background; incompatible with inherit_context and resume. Returns job ID.',
-      }),
-    ),
-  };
-  const scheduleParam: Partial<typeof scheduleParamShape> =
-    isSchedulingEnabled() ? scheduleParamShape : {};
-
-  const scheduleGuideline = isSchedulingEnabled()
-    ? `\n- Use \`schedule\` only when the user explicitly asked for scheduled / recurring / delayed execution (e.g. "every Monday", "in an hour"). Don't auto-schedule from vague intent like "monitor X" — run once now or ask.`
-    : "";
-
-  // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —
-  // the same load-bearing facts as the full version at ~75% fewer tokens, for
-  // small/local models. Per-option details live in the param descriptions.
-  const compactAgentToolDescription = `Launch an autonomous agent for complex, multi-step tasks. Agent types:
-${buildCompactTypeListText()}
-
-Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global).
-
-Notes:
-- description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
-- Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
-- The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.
-- isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
-
-  const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
-
-Available agent types and the tools they have access to:
+Available agent types:
 ${buildTypeListText()}
 
-Custom agents can be defined in .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global) — they are picked up automatically. Project-level agents override global ones. Creating a .md file with the same name as a default agent overrides it.
+Profiles are configured in ~/.pi/agent/subagents.json and .pi/subagents.json. Prompt Markdown is discovered from .pi/agents, .agents/agents, and the global agents directory.
 
-When using the Agent tool, specify a subagent_type parameter to select which agent type to use.
-
-## When not to use
-
-If the target is already known, use a direct tool — \`read\` for a known path, \`grep\`/\`find\` for a specific symbol or string. Reserve this tool for open-ended questions that span the codebase, or tasks that match an available agent type.
-
-## Usage notes
-
-- Always include a short (3-5 word) description summarizing what the agent will do (shown in UI).
-- When you launch multiple agents for independent work, send them in a single message with multiple tool uses, with run_in_background: true on each, so they run concurrently. If the user specifies that they want agents run "in parallel", you MUST send a single message with multiple tool calls. Foreground calls run sequentially — only one executes at a time.
-- When the agent is done, it returns a single message back to you. The result is not visible to the user — to show the user, send a text message with a concise summary.
-- Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
-- Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
-- Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
-- Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
-- Use steer_subagent to send mid-run messages to a running background agent.
-- Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
-- If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
-- Use thinking to control extended thinking level.
-- Use inherit_context if the agent needs the parent conversation history.
-- Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
-
-## Writing the prompt
-
-Provide clear, detailed prompts so the agent can work autonomously. Brief it like a smart colleague who just walked into the room — it hasn't seen this conversation, doesn't know what you've tried, doesn't understand why this task matters.
-- Explain what you're trying to accomplish and why.
-- Describe what you've already learned or ruled out.
-- Give enough context about the surrounding problem that the agent can make judgment calls rather than just following a narrow instruction.
-- If you need a short response, say so ("report in under 200 words").
-- Lookups: hand over the exact command. Investigations: hand over the question — prescribed steps become dead weight when the premise is wrong.
-
-Terse command-style prompts produce shallow, generic work.
-
-**Never delegate understanding.** Don't write "based on your findings, fix the bug" or "based on the research, implement it." Those phrases push synthesis onto the agent instead of doing it yourself. Write prompts that prove you understood: include file paths, line numbers, what specifically to change.`;
-
-  // `toolDescriptionMode: "custom"` — user-authored description with live
-  // dynamic parts. Project file wins over global; missing/empty falls back to
-  // "full" (a stale fallback beats a blank tool description). Only the prose
-  // is customizable — the parameter schema stays code-owned.
-  const renderToolDescriptionTemplate = (template: string): string => {
-    const vars: Record<string, () => string> = {
-      typeList: buildTypeListText,
-      compactTypeList: buildCompactTypeListText,
-      agentDir: getAgentDir,
-      scheduleGuideline: () => scheduleGuideline,
-    };
-    // Replacement callback (not a string) — agent descriptions may contain `$&` etc.
-    return template.replace(/\{\{(\w+)\}\}/g, (raw, name: string) => {
-      if (vars[name]) return vars[name]();
-      console.warn(`[pi-subagents] agent-tool-description.md: unknown placeholder ${raw} left as-is`);
-      return raw;
-    });
-  };
-
-  const loadCustomToolDescription = (): string | undefined => {
-    for (const path of [
-      join(process.cwd(), ".pi", "agent-tool-description.md"),
-      join(getAgentDir(), "agent-tool-description.md"),
-    ]) {
-      try {
-        if (!existsSync(path)) continue;
-        const text = readFileSync(path, "utf-8").trim();
-        if (text) return renderToolDescriptionTemplate(text);
-        console.warn(`[pi-subagents] ${path} is empty — ignoring`);
-      } catch (err) {
-        console.warn(`[pi-subagents] failed to read ${path}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-    return undefined;
-  };
-
-  const agentToolDescription = (() => {
-    const mode = getToolDescriptionMode();
-    if (mode === "compact") return compactAgentToolDescription;
-    if (mode === "custom") {
-      const custom = loadCustomToolDescription();
-      if (custom) return custom;
-      console.warn('[pi-subagents] toolDescriptionMode is "custom" but no agent-tool-description.md found — using "full"');
-    }
-    return fullAgentToolDescription;
-  })();
+Use foreground execution when you need the result before continuing. Use run_in_background for independent work; completion notifications and get_subagent_result provide results. Prompts should be self-contained unless inherit_context is enabled. Use resume with a current-session agent ID, and steer_subagent to redirect a running agent. Verify child-agent changes before reporting completion.`;
 
   pi.registerTool(defineTool({
     name: SUBAGENT_TOOL_NAMES.AGENT,
-    label: "Agent",
-    description: agentToolDescription,
-    promptSnippet: "Launch autonomous sub-agents for complex multi-step tasks",
+    label: "Subagent",
+    description: subagentToolDescription,
+    promptSnippet: "Launch a child agent for complex multi-step tasks",
     promptGuidelines: [
-      "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
-      "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
+      "Use subagent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
+      "For broad codebase exploration or research, spawn subagent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
       "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
     ],
@@ -928,12 +679,6 @@ Terse command-style prompts produce shallow, generic work.
           description: "If true, fork parent conversation into the agent. Default: false (fresh context).",
         }),
       ),
-      isolation: Type.Optional(
-        Type.Literal("worktree", {
-          description: 'Set to "worktree" to run the agent in a temporary git worktree (isolated copy of the repo). Changes are saved to a branch on completion.',
-        }),
-      ),
-      ...scheduleParam,
     }),
 
     // ---- Custom rendering: Claude Code style ----
@@ -1034,9 +779,16 @@ Terse command-style prompts produce shallow, generic work.
       reloadCustomAgents();
 
       const rawType = params.subagent_type as SubagentType;
+      const requestedConfig = getAgentConfig(rawType);
+      if (requestedConfig?.enabled === false) {
+        return textResult(`Agent type "${requestedConfig.name}" is disabled.`);
+      }
       const resolved = resolveType(rawType);
-      const subagentType = resolved ?? "general-purpose";
       const fellBack = resolved === undefined;
+      if (fellBack && getAgentConfig("general-purpose")?.enabled === false) {
+        return textResult(`Unknown agent type "${rawType}" cannot fall back because "general-purpose" is disabled.`);
+      }
+      const subagentType = resolved ?? "general-purpose";
 
       const displayName = getDisplayName(subagentType);
 
@@ -1057,43 +809,13 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      // Scope validation: the effective resolved model is checked against the
-      // user's enabledModels list (read in `enabled-models.ts`).
-      //
-      // Design: scopeModels guards against *runtime* LLM choices, not user-level config.
-      //   - Caller-supplied out-of-scope → hard error (the orchestrator made an explicit
-      //     out-of-scope choice; surface it so it picks differently).
-      //   - Frontmatter-pinned or parent-inherited out-of-scope → warn but proceed (the
-      //     user authored/installed this agent or chose the parent's model; trust it).
-      // See SubagentsSettings.scopeModels docstring for the full policy.
-      if (isScopeModelsEnabled() && model) {
-        const allowed = resolveEnabledModels(readEnabledModels(ctx.cwd), ctx.modelRegistry, ctx.cwd);
-        if (allowed && !isModelInScope(model, allowed)) {
-          if (resolvedConfig.modelFromParams) {
-            const list = [...allowed].sort().map(m => `  ${m}`).join("\n");
-            return textResult(
-              `Model not in scope: "${resolvedConfig.modelInput}".\n\n` +
-              `Allowed models (from enabledModels):\n${list}`,
-            );
-          }
-          // Frontmatter-pinned or parent-inherited: warn + proceed.
-          const agentLabel = customConfig?.displayName ?? subagentType;
-          const modelLabel = resolvedConfig.modelInput ?? `${model.provider}/${model.id}`;
-          ctx.ui.notify(
-            `Agent "${agentLabel}" using out-of-scope model "${modelLabel}"`,
-            "warning",
-          );
-        }
-      }
-
       const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
-      const isolation = resolvedConfig.isolation;
-      // Whether this spawn writes its .output transcript. Per-agent
-      // frontmatter (`output_transcript`) wins; otherwise the project/global
-      // default applies. `attachTranscript` below is the SOLE gate — every
+      // Whether this spawn writes its .output transcript. The per-agent JSON
+      // profile wins; otherwise the project/global default applies. Legacy
+      // `output_transcript` frontmatter remains accepted. `attachTranscript` is the sole gate — every
       // downstream consumer keys off record.outputFile being set, so no spawn
       // path can re-enable the transcript by accident.
       const outputTranscript = customConfig?.outputTranscript ?? getOutputTranscriptDefault();
@@ -1118,7 +840,6 @@ Terse command-style prompts produce shallow, generic work.
         isolated,
         inheritContext,
         runInBackground,
-        isolation,
       };
       // Tool-result render shows the mode label too; viewer's header already does.
       const modeLabel = getPromptModeLabel(subagentType);
@@ -1131,47 +852,6 @@ Terse command-style prompts produce shallow, generic work.
         modelName,
         tags: agentTags.length > 0 ? agentTags : undefined,
       };
-
-      // ---- Schedule: register a job, don't spawn now ----
-      if (params.schedule) {
-        if (!isSchedulingEnabled()) {
-          return textResult("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
-        }
-        if (params.resume) {
-          return textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
-        }
-        if (params.inherit_context) {
-          return textResult("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
-        }
-        if (params.run_in_background === false) {
-          return textResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
-        }
-        if (!scheduler.isActive()) {
-          return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
-        }
-        try {
-          const job = scheduler.addJob({
-            name: params.description as string,
-            description: params.description as string,
-            schedule: params.schedule as string,
-            subagent_type: subagentType,
-            prompt: params.prompt as string,
-            model: params.model as string | undefined,
-            thinking: thinking,
-            max_turns: effectiveMaxTurns,
-            isolated: isolated,
-            isolation: isolation,
-          });
-          const next = scheduler.getNextRun(job.id);
-          return textResult(
-            `Scheduled "${job.name}" (id: ${job.id}, type: ${job.scheduleType}). ` +
-            `Next run: ${next ?? "(unknown)"}. ` +
-            `Manage via /agents → Scheduled jobs.`,
-          );
-        } catch (err) {
-          return textResult(err instanceof Error ? err.message : String(err));
-        }
-      }
 
       // Resume existing agent
       if (params.resume) {
@@ -1223,8 +903,7 @@ Terse command-style prompts produce shallow, generic work.
             inheritContext,
             thinkingLevel: thinking,
             isBackground: true,
-            isolation,
-            invocation: agentInvocation,
+                invocation: agentInvocation,
             ...bgCallbacks,
           });
         } catch (err) {
@@ -1348,8 +1027,7 @@ Terse command-style prompts produce shallow, generic work.
           isolated,
           inheritContext,
           thinkingLevel: thinking,
-          isolation,
-          invocation: agentInvocation,
+            invocation: agentInvocation,
           signal,
           ...fgCallbacks,
         }, (fgAgentId) => {
@@ -1406,7 +1084,7 @@ Terse command-style prompts produce shallow, generic work.
     name: SUBAGENT_TOOL_NAMES.GET_RESULT,
     label: "Get Agent Result",
     description:
-      "Check status and retrieve results from a background agent. Use the agent ID returned by Agent with run_in_background.",
+      "Check status and retrieve results from a background agent. Use the agent ID returned by subagent with run_in_background.",
     promptSnippet: "Check status and retrieve results from a background agent",
     parameters: Type.Object({
       agent_id: Type.String({
@@ -1540,21 +1218,6 @@ Terse command-style prompts produce shallow, generic work.
 
   // ---- /agents interactive menu ----
 
-  const projectAgentsDir = () => join(process.cwd(), ".pi", "agents");
-  const workspaceAgentsDir = () => join(process.cwd(), ".agents", "agents");
-  const personalAgentsDir = () => join(getAgentDir(), "agents");
-
-  /** Find the file path of a custom agent by name, in discovery-precedence order (project, workspace, then global). */
-  function findAgentFile(name: string): { path: string; location: "project" | "workspace" | "personal" } | undefined {
-    const projectPath = join(projectAgentsDir(), `${name}.md`);
-    if (existsSync(projectPath)) return { path: projectPath, location: "project" };
-    const workspacePath = join(workspaceAgentsDir(), `${name}.md`);
-    if (existsSync(workspacePath)) return { path: workspacePath, location: "workspace" };
-    const personalPath = join(personalAgentsDir(), `${name}.md`);
-    if (existsSync(personalPath)) return { path: personalPath, location: "personal" };
-    return undefined;
-  }
-
   function getModelLabel(type: string, registry?: ModelRegistry): string {
     const cfg = getAgentConfig(type);
     if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
@@ -1593,14 +1256,6 @@ Terse command-style prompts produce shallow, generic work.
       options.push(`Agent types (${allNames.length})`);
     }
 
-    // Scheduled jobs entry (always present when scheduler is active)
-    if (scheduler.isActive()) {
-      const jobCount = scheduler.list().length;
-      options.push(`Scheduled jobs (${jobCount})`);
-    }
-
-    // Actions
-    options.push("Create new agent");
     options.push("Settings");
 
     const noAgentsMsg = allNames.length === 0 && agents.length === 0
@@ -1622,11 +1277,6 @@ Terse command-style prompts produce shallow, generic work.
     } else if (choice.startsWith("Agent types (")) {
       await showAllAgentsList(ctx);
       await showAgentsMenu(ctx);
-    } else if (choice.startsWith("Scheduled jobs (")) {
-      await showSchedulesMenu(ctx, scheduler);
-      await showAgentsMenu(ctx);
-    } else if (choice === "Create new agent") {
-      await showCreateWizard(ctx);
     } else if (choice === "Settings") {
       await showSettings(ctx);
       await showAgentsMenu(ctx);
@@ -1754,367 +1404,18 @@ Terse command-style prompts produce shallow, generic work.
 
   async function showAgentDetail(ctx: ExtensionCommandContext, name: string) {
     const cfg = getAgentConfig(name);
-    if (!cfg) {
-      ctx.ui.notify(`Agent config not found for "${name}".`, "warning");
-      return;
-    }
-
-    const file = findAgentFile(name);
-    const isDefault = cfg.isDefault === true;
-    const disabled = cfg.enabled === false;
-
-    let menuOptions: string[];
-    if (disabled && file) {
-      // Disabled agent with a file — offer Enable
-      menuOptions = isDefault
-        ? ["Enable", "Edit", "Reset to default", "Delete", "Back"]
-        : ["Enable", "Edit", "Delete", "Back"];
-    } else if (isDefault && !file) {
-      // Default agent with no .md override
-      menuOptions = ["Eject (export as .md)", "Disable", "Back"];
-    } else if (isDefault && file) {
-      // Default agent with .md override (ejected)
-      menuOptions = ["Edit", "Disable", "Reset to default", "Delete", "Back"];
-    } else {
-      // User-defined agent
-      menuOptions = ["Edit", "Disable", "Delete", "Back"];
-    }
-
-    const choice = await ctx.ui.select(name, menuOptions);
-    if (!choice || choice === "Back") return;
-
-    if (choice === "Edit" && file) {
-      const content = readFileSync(file.path, "utf-8");
-      const edited = await ctx.ui.editor(`Edit ${name}`, content);
-      if (edited !== undefined && edited !== content) {
-        const { writeFileSync } = await import("node:fs");
-        writeFileSync(file.path, edited, "utf-8");
-        reloadCustomAgents();
-        ctx.ui.notify(`Updated ${file.path}`, "info");
-      }
-    } else if (choice === "Delete") {
-      if (file) {
-        const confirmed = await ctx.ui.confirm("Delete agent", `Delete ${name} from ${file.location} (${file.path})?`);
-        if (confirmed) {
-          unlinkSync(file.path);
-          reloadCustomAgents();
-          ctx.ui.notify(`Deleted ${file.path}`, "info");
-        }
-      }
-    } else if (choice === "Reset to default" && file) {
-      const confirmed = await ctx.ui.confirm("Reset to default", `Delete override ${file.path} and restore embedded default?`);
-      if (confirmed) {
-        unlinkSync(file.path);
-        reloadCustomAgents();
-        ctx.ui.notify(`Restored default ${name}`, "info");
-      }
-    } else if (choice.startsWith("Eject")) {
-      await ejectAgent(ctx, name, cfg);
-    } else if (choice === "Disable") {
-      await disableAgent(ctx, name);
-    } else if (choice === "Enable") {
-      await enableAgent(ctx, name);
-    }
-  }
-
-  /** Eject a default agent: write its embedded config as a .md file. */
-  async function ejectAgent(ctx: ExtensionCommandContext, name: string, cfg: AgentConfig) {
-    const location = await ctx.ui.select("Choose location", [
-      "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
+    if (!cfg) return;
+    const tools = cfg.builtinToolNames?.join(", ") ?? "all";
+    const extensions = cfg.extensions === true ? "all" : cfg.extensions === false ? "none" : cfg.extensions.join(", ");
+    await ctx.ui.select(name, [
+      `status: ${cfg.enabled === false ? "disabled" : "enabled"}`,
+      `source: ${cfg.source ?? "default"}`,
+      `model: ${getModelLabel(name, ctx.modelRegistry)}`,
+      `tools: ${tools}`,
+      `extensions: ${extensions}`,
+      `prompt mode: ${cfg.promptMode}`,
+      "Back",
     ]);
-    if (!location) return;
-
-    const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
-    mkdirSync(targetDir, { recursive: true });
-
-    const targetPath = join(targetDir, `${name}.md`);
-    if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
-      if (!overwrite) return;
-    }
-
-    // Build the .md file content
-    const fmFields: string[] = [];
-    fmFields.push(`description: ${JSON.stringify(cfg.description)}`);
-    if (cfg.displayName) fmFields.push(`display_name: ${cfg.displayName}`);
-    fmFields.push(`tools: ${cfg.builtinToolNames?.join(", ") || "all"}`);
-    if (cfg.model) fmFields.push(`model: ${cfg.model}`);
-    if (cfg.thinking) fmFields.push(`thinking: ${cfg.thinking}`);
-    if (cfg.maxTurns) fmFields.push(`max_turns: ${cfg.maxTurns}`);
-    fmFields.push(`prompt_mode: ${cfg.promptMode}`);
-    if (cfg.extensions === false) fmFields.push("extensions: false");
-    else if (Array.isArray(cfg.extensions)) fmFields.push(`extensions: ${cfg.extensions.join(", ")}`);
-    if (cfg.excludeExtensions?.length) fmFields.push(`exclude_extensions: ${cfg.excludeExtensions.join(", ")}`);
-    if (cfg.skills === false) fmFields.push("skills: false");
-    else if (Array.isArray(cfg.skills)) fmFields.push(`skills: ${cfg.skills.join(", ")}`);
-    if (cfg.disallowedTools?.length) fmFields.push(`disallowed_tools: ${cfg.disallowedTools.join(", ")}`);
-    if (cfg.inheritContext) fmFields.push("inherit_context: true");
-    if (cfg.runInBackground) fmFields.push("run_in_background: true");
-    if (cfg.outputTranscript === false) fmFields.push("output_transcript: false");
-    if (cfg.isolated) fmFields.push("isolated: true");
-    if (cfg.memory) fmFields.push(`memory: ${cfg.memory}`);
-    if (cfg.isolation) fmFields.push(`isolation: ${cfg.isolation}`);
-
-    const content = `---\n${fmFields.join("\n")}\n---\n\n${cfg.systemPrompt}\n`;
-
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(targetPath, content, "utf-8");
-    reloadCustomAgents();
-    ctx.ui.notify(`Ejected ${name} to ${targetPath}`, "info");
-  }
-
-  /** Disable an agent: set enabled: false in its .md file, or create a stub for built-in defaults. */
-  async function disableAgent(ctx: ExtensionCommandContext, name: string) {
-    const file = findAgentFile(name);
-    if (file) {
-      // Existing file — set enabled: false in frontmatter (idempotent)
-      const content = readFileSync(file.path, "utf-8");
-      if (content.includes("\nenabled: false\n")) {
-        ctx.ui.notify(`${name} is already disabled.`, "info");
-        return;
-      }
-      const updated = content.replace(/^---\n/, "---\nenabled: false\n");
-      const { writeFileSync } = await import("node:fs");
-      writeFileSync(file.path, updated, "utf-8");
-      reloadCustomAgents();
-      ctx.ui.notify(`Disabled ${name} (${file.path})`, "info");
-      return;
-    }
-
-    // No file (built-in default) — create a stub
-    const location = await ctx.ui.select("Choose location", [
-      "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
-    ]);
-    if (!location) return;
-
-    const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
-    mkdirSync(targetDir, { recursive: true });
-
-    const targetPath = join(targetDir, `${name}.md`);
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(targetPath, "---\nenabled: false\n---\n", "utf-8");
-    reloadCustomAgents();
-    ctx.ui.notify(`Disabled ${name} (${targetPath})`, "info");
-  }
-
-  /** Enable a disabled agent by removing enabled: false from its frontmatter. */
-  async function enableAgent(ctx: ExtensionCommandContext, name: string) {
-    const file = findAgentFile(name);
-    if (!file) return;
-
-    const content = readFileSync(file.path, "utf-8");
-    const updated = content.replace(/^(---\n)enabled: false\n/, "$1");
-    const { writeFileSync } = await import("node:fs");
-
-    // If the file was just a stub ("---\n---\n"), delete it to restore the built-in default
-    if (updated.trim() === "---\n---" || updated.trim() === "---\n---\n") {
-      unlinkSync(file.path);
-      reloadCustomAgents();
-      ctx.ui.notify(`Enabled ${name} (removed ${file.path})`, "info");
-    } else {
-      writeFileSync(file.path, updated, "utf-8");
-      reloadCustomAgents();
-      ctx.ui.notify(`Enabled ${name} (${file.path})`, "info");
-    }
-  }
-
-  async function showCreateWizard(ctx: ExtensionCommandContext) {
-    const location = await ctx.ui.select("Choose location", [
-      "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
-    ]);
-    if (!location) return;
-
-    const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
-
-    const method = await ctx.ui.select("Creation method", [
-      "Generate with Claude (recommended)",
-      "Manual configuration",
-    ]);
-    if (!method) return;
-
-    if (method.startsWith("Generate")) {
-      await showGenerateWizard(ctx, targetDir);
-    } else {
-      await showManualWizard(ctx, targetDir);
-    }
-  }
-
-  async function showGenerateWizard(ctx: ExtensionCommandContext, targetDir: string) {
-    const description = await ctx.ui.input("Describe what this agent should do");
-    if (!description) return;
-
-    const name = await ctx.ui.input("Agent name (filename, no spaces)");
-    if (!name) return;
-
-    mkdirSync(targetDir, { recursive: true });
-
-    const targetPath = join(targetDir, `${name}.md`);
-    if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
-      if (!overwrite) return;
-    }
-
-    ctx.ui.notify("Generating agent definition...", "info");
-
-    const generatePrompt = `Create a custom pi sub-agent definition file based on this description: "${description}"
-
-Write a markdown file to: ${targetPath}
-
-The file format is a markdown file with YAML frontmatter and a system prompt body:
-
-\`\`\`markdown
----
-description: <one-line description shown in UI>
-tools: <comma-separated built-in tools: read, bash, edit, write, grep, find, ls. Use "none" for no tools. Omit for all tools>
-model: <optional model as "provider/modelId", e.g. "anthropic/claude-haiku-4-5". Omit to inherit parent model>
-thinking: <optional thinking level: ${THINKING_LEVELS.join(", ")}. Omit to inherit>
-max_turns: <optional max agentic turns. 0 or omit for unlimited (default)>
-prompt_mode: <"replace" (body IS the full system prompt) or "append" (body is appended to default prompt). Default: replace>
-extensions: <true (inherit all MCP/extension tools), false (none), or comma-separated names. Default: true>
-skills: <true (inherit all), false (none), or comma-separated skill names to preload into prompt. Default: true>
-disallowed_tools: <comma-separated tool names to block, even if otherwise available. Omit for none>
-inherit_context: <true to fork parent conversation into agent so it sees chat history. Default: false>
-run_in_background: <true to run in background by default. Default: false>
-output_transcript: <false to write no transcript file or path for this agent. Independent of persist_session. Default: true>
-isolated: <true for no extension/MCP tools, only built-in tools. Default: false>
-memory: <"user" (global), "project" (per-project), or "local" (gitignored per-project) for persistent memory. Omit for none>
-isolation: <"worktree" to run in isolated git worktree. Omit for normal>
----
-
-<system prompt body — instructions for the agent>
-\`\`\`
-
-Guidelines for choosing settings:
-- For read-only tasks (review, analysis): tools: read, bash, grep, find, ls
-- For code modification tasks: include edit, write
-- Use prompt_mode: append if the agent should keep the default system prompt and add specialization on top
-- Use prompt_mode: replace for fully custom agents with their own personality/instructions
-- Set inherit_context: true if the agent needs to know what was discussed in the parent conversation
-- Set isolated: true if the agent should NOT have access to MCP servers or other extensions
-- Set output_transcript: false to skip writing this agent's transcript; this alone doesn't keep the run off disk (persist_session, isolation: worktree commits, and memory still write) — set those too if that's the goal
-- Only include frontmatter fields that differ from defaults — omit fields where the default is fine
-
-Write the file using the write tool. Only write the file, nothing else.`;
-
-    const { record } = await manager.spawnAndWait(pi, ctx, "general-purpose", generatePrompt, {
-      description: `Generate ${name} agent`,
-      maxTurns: 5,
-    });
-
-    if (record.status === "error") {
-      ctx.ui.notify(`Generation failed: ${record.error}`, "warning");
-      return;
-    }
-
-    reloadCustomAgents();
-
-    if (existsSync(targetPath)) {
-      ctx.ui.notify(`Created ${targetPath}`, "info");
-    } else {
-      ctx.ui.notify("Agent generation completed but file was not created. Check the agent output.", "warning");
-    }
-  }
-
-  async function showManualWizard(ctx: ExtensionCommandContext, targetDir: string) {
-    // 1. Name
-    const name = await ctx.ui.input("Agent name (filename, no spaces)");
-    if (!name) return;
-
-    // 2. Description
-    const description = await ctx.ui.input("Description (one line)");
-    if (!description) return;
-
-    // 3. Tools
-    const toolChoice = await ctx.ui.select("Tools", ["all", "none", "read-only (read, bash, grep, find, ls)", "custom..."]);
-    if (!toolChoice) return;
-
-    let tools: string;
-    if (toolChoice === "all") {
-      tools = BUILTIN_TOOL_NAMES.join(", ");
-    } else if (toolChoice === "none") {
-      tools = "none";
-    } else if (toolChoice.startsWith("read-only")) {
-      tools = "read, bash, grep, find, ls";
-    } else {
-      const customTools = await ctx.ui.input("Tools (comma-separated)", BUILTIN_TOOL_NAMES.join(", "));
-      if (!customTools) return;
-      tools = customTools;
-    }
-
-    // 4. Model
-    const modelChoice = await ctx.ui.select("Model", [
-      "inherit (parent model)",
-      "haiku",
-      "sonnet",
-      "opus",
-      "custom...",
-    ]);
-    if (!modelChoice) return;
-
-    let modelLine = "";
-    if (modelChoice === "haiku") modelLine = "\nmodel: anthropic/claude-haiku-4-5";
-    else if (modelChoice === "sonnet") modelLine = "\nmodel: anthropic/claude-sonnet-4-6";
-    else if (modelChoice === "opus") modelLine = "\nmodel: anthropic/claude-opus-4-6";
-    else if (modelChoice === "custom...") {
-      const customModel = await ctx.ui.input("Model (provider/modelId)");
-      if (customModel) modelLine = `\nmodel: ${customModel}`;
-    }
-
-    // 5. Thinking
-    // "inherit" is a UI-only pseudo-choice (omit the field); the rest mirror pi.
-    const thinkingChoice = await ctx.ui.select("Thinking level", ["inherit", ...THINKING_LEVELS]);
-    if (!thinkingChoice) return;
-
-    let thinkingLine = "";
-    if (thinkingChoice !== "inherit") thinkingLine = `\nthinking: ${thinkingChoice}`;
-
-    // 6. System prompt
-    const systemPrompt = await ctx.ui.editor("System prompt", "");
-    if (systemPrompt === undefined) return;
-
-    // Build the file
-    const content = `---
-description: ${description}
-tools: ${tools}${modelLine}${thinkingLine}
-prompt_mode: replace
----
-
-${systemPrompt}
-`;
-
-    mkdirSync(targetDir, { recursive: true });
-    const targetPath = join(targetDir, `${name}.md`);
-
-    if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
-      if (!overwrite) return;
-    }
-
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(targetPath, content, "utf-8");
-    reloadCustomAgents();
-    ctx.ui.notify(`Created ${targetPath}`, "info");
-  }
-
-  function snapshotSettings(): SubagentsSettings {
-    return {
-      maxConcurrent: manager.getMaxConcurrent(),
-      // 0 = unlimited — per SubagentsSettings.defaultMaxTurns docstring and
-      // normalizeMaxTurns() in agent-runner.ts (which maps 0 → undefined).
-      defaultMaxTurns: getDefaultMaxTurns() ?? 0,
-      graceTurns: getGraceTurns(),
-      defaultJoinMode: getDefaultJoinMode(),
-      schedulingEnabled: isSchedulingEnabled(),
-      scopeModels: isScopeModelsEnabled(),
-      disableDefaultAgents: isDefaultsDisabled(),
-      toolDescriptionMode: getToolDescriptionMode(),
-      fleetView: isFleetViewEnabled(),
-      widgetMode: getWidgetMode(),
-      outputTranscript: getOutputTranscriptDefault(),
-    };
   }
 
   const NUMERIC_IDS = new Set(["maxConcurrent", "defaultMaxTurns", "graceTurns"]);
@@ -2155,30 +1456,9 @@ ${systemPrompt}
           values: ["smart", "async", "group"],
         },
         {
-          id: "schedulingEnabled",
-          label: "Scheduling",
-          description: "Schedule subagent feature (off removes `schedule` param from Agent tool spec on next pi session)",
-          currentValue: isSchedulingEnabled() ? "on" : "off",
-          values: ["on", "off"],
-        },
-        {
-          id: "scopeModels",
-          label: "Scope models",
-          description: "Validate subagent models against scoped models (/scoped-models)",
-          currentValue: isScopeModelsEnabled() ? "on" : "off",
-          values: ["on", "off"],
-        },
-        {
-          id: "disableDefaultAgents",
-          label: "Disable defaults",
-          description: "Hide built-in agents (general-purpose, Explore, Plan) — custom agents are unaffected",
-          currentValue: isDefaultsDisabled() ? "on" : "off",
-          values: ["on", "off"],
-        },
-        {
           id: "outputTranscript",
           label: "Output transcript",
-          description: "Write each subagent's .output transcript by default. A custom agent's output_transcript frontmatter overrides this.",
+          description: "Write each subagent's .output transcript by default. A per-agent JSON profile can override this.",
           currentValue: getOutputTranscriptDefault() ? "on" : "off",
           values: ["on", "off"],
         },
@@ -2196,13 +1476,6 @@ ${systemPrompt}
           currentValue: getWidgetMode(),
           values: ["all", "background", "off"],
         },
-        {
-          id: "toolDescriptionMode",
-          label: "Tool description",
-          description: "Agent tool description sent to the LLM: full (rich, default), compact (~75% fewer tokens, for small/local models), or custom (.pi/agent-tool-description.md with {{placeholders}})",
-          currentValue: getToolDescriptionMode(),
-          values: ["full", "compact", "custom"],
-        },
       ];
     }
 
@@ -2211,60 +1484,37 @@ ${systemPrompt}
         const n = parseInt(value, 10);
         if (n >= 1) {
           manager.setMaxConcurrent(n);
-          notifyApplied(ctx, `Max concurrency set to ${n}`);
+          notifyApplied(ctx, `Max concurrency set to ${n}`, { maxConcurrent: n });
         }
       } else if (id === "defaultMaxTurns") {
         const n = parseInt(value, 10);
         if (n === 0) {
           setDefaultMaxTurns(undefined);
-          notifyApplied(ctx, "Default max turns set to unlimited");
+          notifyApplied(ctx, "Default max turns set to unlimited", { defaultMaxTurns: 0 });
         } else if (n >= 1) {
           setDefaultMaxTurns(n);
-          notifyApplied(ctx, `Default max turns set to ${n}`);
+          notifyApplied(ctx, `Default max turns set to ${n}`, { defaultMaxTurns: n });
         }
       } else if (id === "graceTurns") {
         const n = parseInt(value, 10);
         if (n >= 1) {
           setGraceTurns(n);
-          notifyApplied(ctx, `Grace turns set to ${n}`);
+          notifyApplied(ctx, `Grace turns set to ${n}`, { graceTurns: n });
         }
       } else if (id === "joinMode") {
         setDefaultJoinMode(value as JoinMode);
-        notifyApplied(ctx, `Default join mode set to ${value}`);
-      } else if (id === "schedulingEnabled") {
-        const enabled = value === "on";
-        if (enabled === isSchedulingEnabled()) {
-          ctx.ui.notify(`Scheduling already ${enabled ? "enabled" : "disabled"}.`, "info");
-        } else {
-          setSchedulingEnabled(enabled);
-          if (!enabled) scheduler.stop();  // immediate kill — outstanding fires stop ticking
-          notifyApplied(
-            ctx,
-            `Scheduling ${enabled ? "enabled" : "disabled"}. Tool spec change takes effect on next pi session.`,
-          );
-        }
-      } else if (id === "scopeModels") {
-        const enabled = value === "on";
-        setScopeModelsEnabled(enabled);
-        notifyApplied(ctx, `Scope models ${enabled ? "enabled" : "disabled"}`);
-      } else if (id === "disableDefaultAgents") {
-        const enabled = value === "on";
-        setDisableDefaultAgents(enabled);
-        notifyApplied(ctx, `Default agents ${enabled ? "disabled" : "enabled"}. Tool spec change takes effect on next pi session.`);
+        notifyApplied(ctx, `Default join mode set to ${value}`, { defaultJoinMode: value as JoinMode });
       } else if (id === "outputTranscript") {
         const enabled = value === "on";
         setOutputTranscript(enabled);
-        notifyApplied(ctx, `Output transcript ${enabled ? "enabled" : "disabled"} by default`);
-      } else if (id === "toolDescriptionMode") {
-        setToolDescriptionMode(value as ToolDescriptionMode);
-        notifyApplied(ctx, `Tool description set to ${value}. Takes effect on next pi session.`);
+        notifyApplied(ctx, `Output transcript ${enabled ? "enabled" : "disabled"} by default`, { outputTranscript: enabled });
       } else if (id === "fleetView") {
         const enabled = value === "on";
         setFleetViewEnabled(enabled);
-        notifyApplied(ctx, `Fleet view ${enabled ? "enabled" : "disabled"}`);
+        notifyApplied(ctx, `Fleet view ${enabled ? "enabled" : "disabled"}`, { fleetView: enabled });
       } else if (id === "widgetMode") {
         setWidgetMode(value as WidgetMode);
-        notifyApplied(ctx, `Widget set to ${value}`);
+        notifyApplied(ctx, `Widget set to ${value}`, { widgetMode: value as WidgetMode });
       }
     }
 
@@ -2343,15 +1593,15 @@ ${systemPrompt}
     }
   }
 
-  // Persist the current snapshot, emit `subagents:settings_changed`, and surface
-  // the right toast. Successful saves show info; persistence failures downgrade
-  // to warning so users aren't silently reverted on restart. Event fires regardless
-  // of outcome so listeners see the in-memory change.
-  function notifyApplied(ctx: ExtensionCommandContext, successMsg: string) {
-    const { message, level } = saveAndEmitChanged(
-      snapshotSettings(),
+  // Persist only the explicit project override, emit `subagents:settings_changed`,
+  // and surface the right toast. Global effective values are never copied into
+  // project settings as accidental overrides.
+  function notifyApplied(ctx: ExtensionCommandContext, successMsg: string, patch: SubagentsSettings) {
+    const { message, level } = saveAndEmitProjectPatch(
+      patch,
       successMsg,
       (event, payload) => pi.events.emit(event, payload),
+      ctx.cwd,
     );
     ctx.ui.notify(message, level);
   }

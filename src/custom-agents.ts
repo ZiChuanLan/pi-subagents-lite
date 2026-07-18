@@ -1,167 +1,193 @@
-/**
- * custom-agents.ts — Load user-defined agents from project (.pi/agents/, plus the shared .agents/agents/ workspace) and global ($PI_CODING_AGENT_DIR/agents/, default ~/.pi/agent/agents/) locations.
- */
+/** Load prompt Markdown and merge it with JSON agent profiles. */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
-import type { AgentConfig, MemoryScope, ThinkingLevel } from "./types.js";
+import { DEFAULT_AGENTS } from "./default-agents.js";
+import { loadSettings } from "./settings.js";
+import type { AgentConfig, AgentProfile, AgentTools, ThinkingLevel } from "./types.js";
 
-/**
- * Scan for custom agent .md files from multiple locations.
- * Discovery hierarchy (higher priority wins):
- *   1. Project:   <cwd>/.pi/agents/*.md (authoritative — also where /agents writes)
- *   2. Workspace: <cwd>/.agents/agents/*.md (shared cross-tool .agents workspace, read-only)
- *   3. Global:    $PI_CODING_AGENT_DIR/agents/*.md (default: ~/.pi/agent/agents/*.md)
- *
- * Project-level agents override global ones with the same name. On a name clash
- * between the two project locations, .pi/agents wins — .pi stays the project
- * authority; .agents/agents is an additional read location.
- * Any name is allowed — names matching defaults (e.g. "Explore") override them.
- */
-export function loadCustomAgents(cwd: string): Map<string, AgentConfig> {
-  const globalDir = join(getAgentDir(), "agents");
-  const workspaceProjectDir = join(cwd, ".agents", "agents");
-  const projectDir = join(cwd, ".pi", "agents");
+interface MarkdownAgent {
+  name: string;
+  body: string;
+  legacy: Partial<AgentConfig>;
+  source: "project" | "global";
+}
 
+export function loadCustomAgents(cwd: string, profiles = loadSettings(cwd).agents ?? {}): Map<string, AgentConfig> {
+  const markdown = new Map<string, MarkdownAgent>();
+  loadFromDir(join(getAgentDir(), "agents"), markdown, "global");
+  loadFromDir(join(cwd, ".agents", "agents"), markdown, "project");
+  loadFromDir(join(cwd, ".pi", "agents"), markdown, "project");
+
+  const names = new Set([...markdown.keys(), ...Object.keys(profiles)]);
   const agents = new Map<string, AgentConfig>();
-  loadFromDir(globalDir, agents, "global");            // lowest priority
-  loadFromDir(workspaceProjectDir, agents, "project"); // shared workspace
-  loadFromDir(projectDir, agents, "project");          // highest priority (overwrites)
+  for (const name of names) {
+    const md = markdown.get(name);
+    const profile = profiles[name];
+    const embedded = DEFAULT_AGENTS.get(name);
+    const base: AgentConfig = embedded
+      ? { ...embedded }
+      : {
+          name,
+          description: name,
+          extensions: true,
+          systemPrompt: "",
+          promptMode: "replace",
+          enabled: true,
+        };
+
+    const fromMarkdown: AgentConfig = {
+      ...base,
+      ...md?.legacy,
+      name,
+      systemPrompt: md?.body ?? base.systemPrompt,
+      source: md?.source ?? (profile ? "json" : base.source),
+    };
+    agents.set(name, applyProfile(fromMarkdown, profile));
+  }
   return agents;
 }
 
-/** Load agent configs from a directory into the map. */
-function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "project" | "global"): void {
+function loadFromDir(
+  dir: string,
+  agents: Map<string, MarkdownAgent>,
+  source: "project" | "global",
+): void {
   if (!existsSync(dir)) return;
-
   let files: string[];
   try {
-    files = readdirSync(dir).filter(f => f.endsWith(".md"));
+    files = readdirSync(dir).filter((file) => file.endsWith(".md"));
   } catch {
     return;
   }
 
   for (const file of files) {
-    const name = basename(file, ".md");
-
     let content: string;
     try {
       content = readFileSync(join(dir, file), "utf-8");
     } catch {
       continue;
     }
-
-    const { frontmatter: fm, body } = parseFrontmatter<Record<string, unknown>>(content);
-
-    const { builtinToolNames, extSelectors } = parseToolsField(fm.tools);
-
+    const name = basename(file, ".md");
+    const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
     agents.set(name, {
       name,
-      displayName: str(fm.display_name),
-      description: str(fm.description) ?? name,
-      builtinToolNames,
-      extSelectors,
-      disallowedTools: csvListOptional(fm.disallowed_tools),
-      extensions: inheritField(fm.extensions ?? fm.inherit_extensions),
-      excludeExtensions: csvListOptional(fm.exclude_extensions),
-      skills: inheritField(fm.skills ?? fm.inherit_skills),
-      model: str(fm.model),
-      thinking: str(fm.thinking) as ThinkingLevel | undefined,
-      maxTurns: nonNegativeInt(fm.max_turns),
-      persistSession: fm.persist_session != null ? fm.persist_session === true : undefined,
-      outputTranscript: fm.output_transcript != null ? fm.output_transcript !== false : undefined,
-      sessionDir: str(fm.session_dir),
-      systemPrompt: body.trim(),
-      promptMode: fm.prompt_mode === "append" ? "append" : "replace",
-      inheritContext: fm.inherit_context != null ? fm.inherit_context === true : undefined,
-      runInBackground: fm.run_in_background != null ? fm.run_in_background === true : undefined,
-      isolated: fm.isolated != null ? fm.isolated === true : undefined,
-      memory: parseMemory(fm.memory),
-      isolation: fm.isolation === "worktree" ? "worktree" : undefined,
-      enabled: fm.enabled !== false,  // default true; explicitly false disables
+      body: body.trim(),
+      legacy: parseLegacyFrontmatter(frontmatter),
       source,
     });
   }
 }
 
-// ---- Field parsers ----
-// All follow the same convention: omitted → default, "none"/empty → nothing, value → exact.
-
-/** Extract a string or undefined. */
-function str(val: unknown): string | undefined {
-  return typeof val === "string" ? val : undefined;
+function applyProfile(config: AgentConfig, profile: AgentProfile | undefined): AgentConfig {
+  if (!profile) return config;
+  const next = { ...config };
+  if (profile.displayName !== undefined) next.displayName = profile.displayName;
+  if (profile.description !== undefined) next.description = profile.description;
+  if (profile.model !== undefined) next.model = profile.model;
+  if (profile.thinking !== undefined) next.thinking = profile.thinking;
+  if (profile.maxTurns !== undefined) next.maxTurns = profile.maxTurns;
+  if (profile.tools !== undefined) {
+    const tools = partitionTools(profile.tools);
+    next.builtinToolNames = tools.builtinToolNames;
+    next.extSelectors = tools.extSelectors;
+  }
+  if (profile.enabled !== undefined) next.enabled = profile.enabled;
+  if (profile.promptMode !== undefined) next.promptMode = profile.promptMode;
+  if (profile.inheritContext !== undefined) next.inheritContext = profile.inheritContext;
+  if (profile.runInBackground !== undefined) next.runInBackground = profile.runInBackground;
+  if (profile.isolated !== undefined) next.isolated = profile.isolated;
+  if (profile.extensions !== undefined) next.extensions = profile.extensions;
+  if (profile.excludeExtensions !== undefined) next.excludeExtensions = profile.excludeExtensions;
+  if (profile.disallowedTools !== undefined) next.disallowedTools = profile.disallowedTools;
+  if (profile.outputTranscript !== undefined) next.outputTranscript = profile.outputTranscript;
+  return next;
 }
 
-/** Extract a non-negative integer or undefined. 0 means unlimited for max_turns. */
-function nonNegativeInt(val: unknown): number | undefined {
-  return typeof val === "number" && val >= 0 ? val : undefined;
-}
-
-/**
- * Parse a raw CSV field value into items, or undefined if absent/empty/"none".
- */
-function parseCsvField(val: unknown): string[] | undefined {
-  if (val === undefined || val === null) return undefined;
-  const s = String(val).trim();
-  if (!s || s === "none") return undefined;
-  const items = s.split(",").map(t => t.trim()).filter(Boolean);
-  return items.length > 0 ? items : undefined;
-}
-
-/**
- * Parse a comma-separated list field with defaults.
- * omitted → defaults; "none"/empty → []; csv → listed items.
- */
-function csvList(val: unknown, defaults: string[]): string[] {
-  if (val === undefined || val === null) return defaults;
-  return parseCsvField(val) ?? [];
-}
-
-/**
- * Partition the `tools:` CSV into the built-in tool allowlist and raw `ext:` selectors.
- * `*` (and the case-insensitive alias `all`, for `tools: all`) expands to all
- * built-ins; plain entries are built-in names; `ext:` entries are extension-tool
- * selectors parsed later by the runner. omitted → all built-ins, no selectors.
- * `tools:` present with only `ext:` entries → zero built-ins (use `*`).
- */
-function parseToolsField(val: unknown): { builtinToolNames: string[]; extSelectors: string[] | undefined } {
-  const entries = csvList(val, BUILTIN_TOOL_NAMES);
-  const isWildcard = (e: string) => e === "*" || e.toLowerCase() === "all";
-  const hasWildcard = entries.some(isWildcard);
-  const plain = entries.filter(e => !isWildcard(e) && !e.startsWith("ext:"));
-  const extEntries = entries.filter(e => e.startsWith("ext:"));
+function partitionTools(tools: AgentTools): {
+  builtinToolNames: string[] | undefined;
+  extSelectors: string[] | undefined;
+} {
+  if (tools === "all") return { builtinToolNames: undefined, extSelectors: undefined };
+  if (tools === "none") return { builtinToolNames: [], extSelectors: undefined };
+  const wildcard = tools.some((item) => item === "*" || item.toLowerCase() === "all");
+  const extSelectors = tools.filter((item) => item.startsWith("ext:"));
+  const plain = tools.filter((item) => item !== "*" && item.toLowerCase() !== "all" && !item.startsWith("ext:"));
   return {
-    builtinToolNames: hasWildcard ? [...new Set([...BUILTIN_TOOL_NAMES, ...plain])] : plain,
-    extSelectors: extEntries.length > 0 ? extEntries : undefined,
+    builtinToolNames: wildcard ? [...new Set([...BUILTIN_TOOL_NAMES, ...plain])] : plain,
+    extSelectors: extSelectors.length > 0 ? extSelectors : undefined,
   };
 }
 
-/**
- * Parse an optional comma-separated list field.
- * omitted → undefined; "none"/empty → undefined; csv → listed items.
- */
-function csvListOptional(val: unknown): string[] | undefined {
-  return parseCsvField(val);
+function parseLegacyFrontmatter(frontmatter: Record<string, unknown>): Partial<AgentConfig> {
+  const config: Partial<AgentConfig> = {};
+  const displayName = stringValue(frontmatter.display_name);
+  const description = stringValue(frontmatter.description);
+  const model = stringValue(frontmatter.model);
+  const thinking = stringValue(frontmatter.thinking);
+  const maxTurns = nonNegativeInt(frontmatter.max_turns);
+  const tools = legacyTools(frontmatter.tools);
+  const extensions = inheritField(frontmatter.extensions ?? frontmatter.inherit_extensions);
+  const excludeExtensions = stringList(frontmatter.exclude_extensions);
+  const disallowedTools = stringList(frontmatter.disallowed_tools);
+
+  if (displayName !== undefined) config.displayName = displayName;
+  if (description !== undefined) config.description = description;
+  if (model !== undefined) config.model = model;
+  if (thinking !== undefined) config.thinking = thinking as ThinkingLevel;
+  if (maxTurns !== undefined) config.maxTurns = maxTurns;
+  if (tools !== undefined) {
+    config.builtinToolNames = tools.builtinToolNames;
+    config.extSelectors = tools.extSelectors;
+  }
+  if (extensions !== undefined) config.extensions = extensions;
+  if (excludeExtensions !== undefined) config.excludeExtensions = excludeExtensions;
+  if (disallowedTools !== undefined) config.disallowedTools = disallowedTools;
+  if (frontmatter.output_transcript != null) config.outputTranscript = frontmatter.output_transcript !== false;
+  if (frontmatter.prompt_mode != null) config.promptMode = frontmatter.prompt_mode === "append" ? "append" : "replace";
+  if (frontmatter.inherit_context != null) config.inheritContext = frontmatter.inherit_context === true;
+  if (frontmatter.run_in_background != null) config.runInBackground = frontmatter.run_in_background === true;
+  if (frontmatter.isolated != null) config.isolated = frontmatter.isolated === true;
+  if (frontmatter.enabled != null) config.enabled = frontmatter.enabled !== false;
+  return config;
 }
 
-/**
- * Parse a memory scope field.
- * omitted → undefined; "user"/"project"/"local" → MemoryScope.
- */
-function parseMemory(val: unknown): MemoryScope | undefined {
-  if (val === "user" || val === "project" || val === "local") return val;
-  return undefined;
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }
 
-/**
- * Parse an inherit field (extensions, skills).
- * omitted/true → true (inherit all); false/"none"/empty → false; csv → listed names.
- */
-function inheritField(val: unknown): true | string[] | false {
-  if (val === undefined || val === null || val === true) return true;
-  if (val === false || val === "none") return false;
-  const items = csvList(val, []);
-  return items.length > 0 ? items : false;
+function nonNegativeInt(value: unknown): number | undefined {
+  return Number.isInteger(value) && (value as number) >= 0 ? value as number : undefined;
+}
+
+function stringList(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) {
+    const values = value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+    return values.length > 0 ? values : undefined;
+  }
+  if (value == null) return undefined;
+  const raw = String(value).trim();
+  if (!raw || raw.toLowerCase() === "none") return undefined;
+  const values = raw.split(",").map((item) => item.trim()).filter(Boolean);
+  return values.length > 0 ? values : undefined;
+}
+
+function legacyTools(value: unknown): {
+  builtinToolNames: string[] | undefined;
+  extSelectors: string[] | undefined;
+} | undefined {
+  if (value == null) return undefined;
+  if (typeof value === "string" && value.trim().toLowerCase() === "none") {
+    return { builtinToolNames: [], extSelectors: undefined };
+  }
+  return partitionTools(stringList(value) ?? []);
+}
+
+function inheritField(value: unknown): true | string[] | false | undefined {
+  if (value == null) return undefined;
+  if (value === true) return true;
+  if (value === false || value === "none") return false;
+  return stringList(value) ?? false;
 }

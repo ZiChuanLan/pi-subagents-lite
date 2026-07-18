@@ -8,13 +8,7 @@ vi.mock("../src/agent-runner.js", () => ({
   resumeAgent: vi.fn(),
 }));
 
-vi.mock("../src/worktree.js", () => ({
-  createWorktree: vi.fn(),
-  cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
-  pruneWorktrees: vi.fn(),
-}));
-
-import { runAgent } from "../src/agent-runner.js";
+import { type RunResult, resumeAgent, runAgent } from "../src/agent-runner.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
@@ -463,8 +457,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
     expect(manager.getRecord(id)!.compactionCount).toBe(0);
 
     // Now resume — drive callbacks via the mocked resumeAgent
-    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
-    vi.mocked(resumeMock).mockImplementation(async (_session, _prompt, opts: any) => {
+    vi.mocked(resumeAgent).mockImplementation(async (_session, _prompt, opts: any) => {
       opts.onAssistantUsage?.({ input: 70, output: 30, cacheWrite: 5 });
       opts.onCompaction?.({ reason: "overflow", tokensBefore: 999 });
       return { text: "second" };
@@ -474,34 +467,6 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
 
     expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 70, output: 30, cacheWrite: 5 });
     expect(manager.getRecord(id)!.compactionCount).toBe(1);
-  });
-});
-
-// Regression: `isolation: "worktree"` MUST fail loud when the cwd can't host
-// a worktree. The previous behavior silently fell back to the main tree and
-// injected a warning into the LLM's prompt — invisible to the caller.
-describe("AgentManager — isolation: worktree fails loud, no silent fallback", () => {
-  let manager: AgentManager;
-
-  afterEach(() => {
-    manager?.dispose();
-  });
-
-  it("spawn() throws when createWorktree returns undefined; no orphan record left behind", async () => {
-    const { createWorktree } = await import("../src/worktree.js");
-    vi.mocked(createWorktree).mockReturnValueOnce(undefined);
-    vi.mocked(runAgent).mockClear();
-
-    manager = new AgentManager();
-    expect(() => manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
-      description: "test",
-      isolation: "worktree",
-    })).toThrow(/isolation: "worktree"/);
-
-    // Cleaned up — no orphan in listAgents()
-    expect(manager.listAgents()).toEqual([]);
-    // runAgent never invoked — strict, no silent fallback
-    expect(runAgent).not.toHaveBeenCalled();
   });
 });
 
@@ -552,54 +517,6 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
 
     const opts = vi.mocked(runAgent).mock.lastCall![3];
     expect(opts.cwd).toBeUndefined();
-    expect(opts.configCwd).toBeUndefined();
-  });
-
-  it("cwd + isolation: worktree — worktree created FROM cwd, session runs at the copy's workPath, cleanup targets cwd's repo", async () => {
-    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
-    vi.mocked(createWorktree).mockReturnValueOnce({
-      path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", workPath: "/wt/copy/packages/api",
-    });
-    resolvedRun();
-
-    manager = new AgentManager();
-    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
-      description: "test",
-      cwd: "/",
-      isolation: "worktree",
-    });
-    await manager.getRecord(id)!.promise;
-
-    expect(createWorktree).toHaveBeenCalledWith("/", id);
-    // Worktree wins for the working dir — at workPath, so subdirectory scoping
-    // survives isolation. Config still anchored to the parent.
-    expect(runAgent).toHaveBeenCalledWith(
-      mockCtx, "general-purpose", "test",
-      expect.objectContaining({ cwd: "/wt/copy/packages/api", configCwd: "/tmp" }),
-    );
-    expect(cleanupWorktree).toHaveBeenCalledWith("/", expect.anything(), "test");
-  });
-
-  it("plain worktree (no cwd) keeps the historical root working dir even when workPath differs", async () => {
-    // Parent session sitting in a repo subdirectory: workPath would point at
-    // the copied subdir. Without SpawnOptions.cwd the agent must stay at the
-    // copy's root — moving it would also move .pi config discovery.
-    const { createWorktree } = await import("../src/worktree.js");
-    vi.mocked(createWorktree).mockReturnValueOnce({
-      path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", workPath: "/wt/copy/sub/dir",
-    });
-    vi.mocked(runAgent).mockClear();
-    resolvedRun();
-
-    manager = new AgentManager();
-    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
-      description: "test",
-      isolation: "worktree",
-    });
-    await manager.getRecord(id)!.promise;
-
-    const opts = vi.mocked(runAgent).mock.lastCall![3];
-    expect(opts.cwd).toBe("/wt/copy");
     expect(opts.configCwd).toBeUndefined();
   });
 
@@ -741,6 +658,73 @@ describe("AgentManager — abort() state machine", () => {
 // Regression for #44: ESC during a foreground Agent call must propagate to
 // the child. Pi delivers parent abort via AbortSignal; the manager wires the
 // signal's "abort" event to this.abort(id).
+describe("AgentManager — managed resume lifecycle", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  async function completedRecord(): Promise<{ id: string; record: AgentRecord }> {
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", { description: "x", isBackground: true });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+    return { id, record };
+  }
+
+  it("abort(id) stops a resumed run and late completion cannot overwrite stopped", async () => {
+    manager = new AgentManager();
+    const { id, record } = await completedRecord();
+    let resolveResume: ((value: { text: string }) => void) | undefined;
+    vi.mocked(resumeAgent).mockImplementation((_session, _prompt, options) => new Promise((resolve) => {
+      resolveResume = resolve;
+      options?.signal?.addEventListener("abort", () => {});
+    }));
+
+    const resumed = manager.resume(id, "continue");
+    await Promise.resolve();
+    expect(record.status).toBe("running");
+    expect(manager.abort(id)).toBe(true);
+    expect(record.abortController?.signal.aborted).toBe(true);
+
+    resolveResume?.({ text: "late result" });
+    await resumed;
+    expect(record.status).toBe("stopped");
+    expect(record.result).toBe("late result");
+  });
+
+  it("waitForAll waits for the current resumed promise", async () => {
+    manager = new AgentManager();
+    const { id, record } = await completedRecord();
+    let resolveResume: ((value: { text: string }) => void) | undefined;
+    vi.mocked(resumeAgent).mockImplementation(() => new Promise((resolve) => { resolveResume = resolve; }));
+
+    const resumed = manager.resume(id, "continue");
+    await Promise.resolve();
+    let waited = false;
+    const wait = manager.waitForAll().then(() => { waited = true; });
+    await Promise.resolve();
+    expect(waited).toBe(false);
+    expect(record.promise).toBeDefined();
+
+    resolveResume?.({ text: "resumed" });
+    await Promise.all([resumed, wait]);
+    expect(waited).toBe(true);
+    expect(record.status).toBe("completed");
+  });
+
+  it("parent abort signals stop resumed runs", async () => {
+    manager = new AgentManager();
+    const { id, record } = await completedRecord();
+    const parent = new AbortController();
+    vi.mocked(resumeAgent).mockImplementation(() => new Promise(() => {}));
+
+    void manager.resume(id, "continue", parent.signal);
+    await Promise.resolve();
+    parent.abort();
+    expect(record.status).toBe("stopped");
+    expect(record.abortController?.signal.aborted).toBe(true);
+  });
+});
+
 describe("AgentManager — steer()", () => {
   let manager: AgentManager;
   afterEach(() => manager?.dispose());
@@ -966,7 +950,7 @@ describe("AgentManager — resolved runs with a failed final turn map to error (
 
   it("an external stop still wins over a late failure resolution", async () => {
     manager = new AgentManager();
-    let resolveRun: ((v: unknown) => void) | undefined;
+    let resolveRun: ((value: RunResult | PromiseLike<RunResult>) => void) | undefined;
     const session = mockSession();
     vi.mocked(runAgent).mockImplementation(() => new Promise((r) => { resolveRun = r; }));
 
@@ -988,10 +972,9 @@ describe("AgentManager — resolved runs with a failed final turn map to error (
     await record.promise;
     expect(record.status).toBe("completed");
 
-    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
     // resumeAgent bounds its fallback to this invocation, so a failed empty
     // resume yields text "" — never the prior turn's answer (#144 root-fix).
-    vi.mocked(resumeMock).mockResolvedValue({
+    vi.mocked(resumeAgent).mockResolvedValue({
       text: "",
       failure: "retries exhausted on resume",
     });
@@ -1010,8 +993,7 @@ describe("AgentManager — resolved runs with a failed final turn map to error (
     const record = manager.getRecord(id)!;
     await record.promise;
 
-    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
-    vi.mocked(resumeMock).mockResolvedValue({
+    vi.mocked(resumeAgent).mockResolvedValue({
       text: "new partial progress",
       failure: "provider died mid-turn",
     });

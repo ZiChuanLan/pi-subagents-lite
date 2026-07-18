@@ -1,9 +1,3 @@
-/**
- * status-note-wiring.test.ts — proves the status note actually reaches the
- * PARENT through the real tool handlers, not just that getStatusNote() returns
- * a string. Drives the registered `Agent` / `get_subagent_result` tools and
- * inspects the text delivered back, for a turn-limit abort and a user stop.
- */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
@@ -14,35 +8,24 @@ vi.mock("../src/agent-runner.js", async () => {
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 
+const MANAGER_KEY = Symbol.for("pi-subagents:manager");
+
+type ManagerHandle = {
+  abort(id: string): boolean;
+};
+
 function makePi() {
   const tools = new Map<string, any>();
-  const eventHandlers = new Map<string, any>();
   const lifecycle = new Map<string, any>();
   const pi = {
     registerMessageRenderer: vi.fn(),
-    registerTool: vi.fn((t: any) => tools.set(t.name, t)),
+    registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
     registerCommand: vi.fn(),
     on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
-    events: {
-      emit: vi.fn(),
-      on: vi.fn((event: string, handler: any) => {
-        eventHandlers.set(event, handler);
-        return vi.fn();
-      }),
-    },
-    appendEntry: vi.fn(),
+    events: { emit: vi.fn(), on: vi.fn(() => vi.fn()) },
     sendMessage: vi.fn(),
   } as any;
-  return { pi, tools, eventHandlers, lifecycle };
-}
-
-// The RPC channels are registered on the first bound session_start (#142), so a
-// test that drives them must fire it first — as a real session always does. A
-// sessionId-less ctx makes startScheduler short-circuit (no filesystem touch).
-async function bind(lifecycle: Map<string, any>) {
-  const bindCtx = ctx();
-  bindCtx.sessionManager.getSessionId = vi.fn(() => undefined);
-  await lifecycle.get("session_start")({}, bindCtx);
+  return { pi, tools, lifecycle };
 }
 
 function ctx() {
@@ -57,58 +40,73 @@ function ctx() {
   } as any;
 }
 
-const textOf = (r: any): string => r.content[0].text;
+const textOf = (result: any): string => result.content[0].text;
+
+async function shutdown(lifecycle: Map<string, any>): Promise<void> {
+  await lifecycle.get("session_shutdown")?.({}, ctx());
+}
 
 describe("status note reaches the parent through the real handlers", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as Record<symbol, unknown>)[MANAGER_KEY];
+  });
 
-  it("foreground turn-limit abort → the Agent result flags an incomplete outcome", async () => {
+  it("foreground turn-limit abort is reported as incomplete", async () => {
     vi.mocked(runAgent).mockResolvedValue({
       responseText: "partial work so far",
       session: { dispose: vi.fn() } as any,
-      aborted: true, // hard turn-limit abort
+      aborted: true,
       steered: false,
     });
-    const { pi, tools } = makePi();
+    const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
 
-    const res = await tools.get("Agent").execute(
+    const result = await tools.get("subagent").execute(
       "tc1",
       { prompt: "go", description: "d", subagent_type: "general-purpose" },
-      undefined, undefined, ctx(),
+      undefined,
+      undefined,
+      ctx(),
     );
 
-    const out = textOf(res);
-    expect(out).toContain("hit the turn limit");      // getStatusNote("aborted") is wired in
-    expect(out).toContain("partial work so far");     // partial result still delivered
-    expect(out).not.toContain("STOPPED BY THE USER"); // not mislabelled as a user stop
+    const output = textOf(result);
+    expect(output).toContain("hit the turn limit");
+    expect(output).toContain("partial work so far");
+    expect(output).not.toContain("STOPPED BY THE USER");
+    await shutdown(lifecycle);
   });
 
-  it("background user-stop → get_subagent_result flags STOPPED BY THE USER (not completed)", async () => {
-    // A background agent that never settles on its own — only a stop ends it.
+  it("background user stop is reported as stopped, not completed", async () => {
     vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as any);
-    const { pi, tools, eventHandlers, lifecycle } = makePi();
+    const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
-    await bind(lifecycle); // register RPC channels via session_start (#142)
 
-    const spawn = await tools.get("Agent").execute(
+    const spawn = await tools.get("subagent").execute(
       "tc2",
       { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: true },
-      undefined, undefined, ctx(),
+      undefined,
+      undefined,
+      ctx(),
     );
     const id = textOf(spawn).match(/Agent ID: (\S+)/)?.[1];
-    expect(id, "background spawn should surface an agent id").toBeTruthy();
+    expect(id).toBeTruthy();
 
-    // The user stops it — same path the viewer's stop key uses (manager.abort).
-    eventHandlers.get("subagents:rpc:stop")?.({ requestId: "r1", agentId: id });
+    const manager = (globalThis as Record<symbol, unknown>)[MANAGER_KEY] as ManagerHandle;
+    expect(manager.abort(id!)).toBe(true);
 
-    const res = await tools.get("get_subagent_result").execute(
-      "tc3", { agent_id: id }, undefined, undefined, ctx(),
+    const result = await tools.get("get_subagent_result").execute(
+      "tc3",
+      { agent_id: id },
+      undefined,
+      undefined,
+      ctx(),
     );
 
-    const out = textOf(res);
-    expect(out).toContain("STOPPED BY THE USER");
-    expect(out).toContain("the task was NOT finished");
-    expect(out).not.toContain("Done"); // not surfaced as a normal completion
+    const output = textOf(result);
+    expect(output).toContain("STOPPED BY THE USER");
+    expect(output).toContain("the task was NOT finished");
+    expect(output).not.toContain("Done");
+    await shutdown(lifecycle);
   });
 });

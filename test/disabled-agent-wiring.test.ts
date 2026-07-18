@@ -2,7 +2,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RunResult } from "../src/agent-runner.js";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -26,41 +25,42 @@ function makePi() {
   return { pi, tools, lifecycle };
 }
 
-function ctx(cwd: string, sessionId: string) {
+function ctx(cwd: string) {
   return {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,
     model: undefined,
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
-    sessionManager: { getSessionId: vi.fn(() => sessionId), getBranch: vi.fn(() => []) },
+    sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
 }
 
 const textOf = (result: any): string => result.content[0].text;
-const flush = async () => {
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setImmediate(resolve));
-};
 
 const MANAGER_KEY = Symbol.for("pi-subagents:manager");
 
-describe("session switch isolates old child agents", () => {
+describe("disabled agent execution boundary", () => {
   let cwd: string;
   let agentDir: string;
   let previousCwd: string;
   let previousAgentDir: string | undefined;
 
   beforeEach(() => {
-    cwd = mkdtempSync(join(tmpdir(), "subagents-switch-"));
-    agentDir = mkdtempSync(join(tmpdir(), "subagents-switch-global-"));
+    cwd = mkdtempSync(join(tmpdir(), "subagents-disabled-"));
+    agentDir = mkdtempSync(join(tmpdir(), "subagents-disabled-global-"));
     previousCwd = process.cwd();
     previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.chdir(cwd);
     process.env.PI_CODING_AGENT_DIR = agentDir;
     mkdirSync(join(cwd, ".pi"), { recursive: true });
-    writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ defaultJoinMode: "async" }));
+    writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({
+      agents: {
+        blocked: { enabled: false, tools: "all" },
+        observer: { description: "No-tool observer", tools: "none", extensions: false },
+      },
+    }));
   });
 
   afterEach(() => {
@@ -73,45 +73,45 @@ describe("session switch isolates old child agents", () => {
     vi.restoreAllMocks();
   });
 
-  it("drops records and ignores a late completion after the replacement session starts", async () => {
-    let resolveRun: ((value: RunResult | PromiseLike<RunResult>) => void) | undefined;
-    vi.mocked(runAgent).mockImplementation(() => new Promise((resolve) => { resolveRun = resolve; }));
-    const oldSession = { dispose: vi.fn() } as any;
+  it("rejects a disabled type without falling back or invoking runAgent", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const tool = tools.get("subagent");
+    expect(tool.description).toContain("observer: No-tool observer (Tools: none)");
+    expect(tool.description).not.toContain("blocked:");
+
+    const result = await tool.execute(
+      "tc",
+      { prompt: "go", description: "blocked", subagent_type: "BLOCKED" },
+      undefined,
+      undefined,
+      ctx(cwd),
+    );
+
+    expect(textOf(result)).toBe('Agent type "blocked" is disabled.');
+    expect(runAgent).not.toHaveBeenCalled();
+    await lifecycle.get("session_shutdown")?.({}, ctx(cwd));
+  });
+
+  it("does not route an unknown type through a disabled general-purpose fallback", async () => {
+    writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({
+      agents: { "general-purpose": { enabled: false } },
+    }));
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
 
-    const spawn = await tools.get("subagent").execute(
-      "tc-spawn",
-      { prompt: "go", description: "old work", subagent_type: "general-purpose", run_in_background: true },
+    const result = await tools.get("subagent").execute(
+      "tc",
+      { prompt: "go", description: "unknown", subagent_type: "does-not-exist" },
       undefined,
       undefined,
-      ctx(cwd, "old-session"),
+      ctx(cwd),
     );
-    const id = textOf(spawn).match(/Agent ID: (\S+)/)?.[1];
-    expect(id).toBeTruthy();
 
-    await lifecycle.get("session_before_switch")?.({}, ctx(cwd, "old-session"));
-    await lifecycle.get("session_start")?.({}, ctx(cwd, "new-session"));
-    pi.events.emit.mockClear();
-    pi.sendMessage.mockClear();
-
-    resolveRun?.({ responseText: "OLD RESULT", session: oldSession, aborted: false, steered: false });
-    await flush();
-    await new Promise((resolve) => setTimeout(resolve, 250));
-
-    expect(oldSession.dispose).toHaveBeenCalled();
-    expect(pi.sendMessage).not.toHaveBeenCalled();
-    expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:completed", expect.anything());
-    expect(pi.events.emit).not.toHaveBeenCalledWith("subagents:failed", expect.anything());
-
-    const result = await tools.get("get_subagent_result").execute(
-      "tc-read",
-      { agent_id: id },
-      undefined,
-      undefined,
-      ctx(cwd, "new-session"),
+    expect(textOf(result)).toBe(
+      'Unknown agent type "does-not-exist" cannot fall back because "general-purpose" is disabled.',
     );
-    expect(textOf(result)).toContain("Agent not found");
-    await lifecycle.get("session_shutdown")?.({}, ctx(cwd, "new-session"));
+    expect(runAgent).not.toHaveBeenCalled();
+    await lifecycle.get("session_shutdown")?.({}, ctx(cwd));
   });
 });

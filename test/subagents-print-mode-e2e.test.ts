@@ -60,7 +60,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
         parentFinal: (ctx: Context) => {
           const childOut = [...ctx.messages]
             .reverse()
-            .find((m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent");
+            .find((m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "subagent");
           const text = ((childOut?.content ?? []) as Array<{ text?: string }>)
             .map((b) => b.text ?? "")
             .join("");
@@ -70,7 +70,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
       }),
     });
 
-    // The child actually ran: its output reached the parent via the Agent tool
+    // The child actually ran: its output reached the parent via the subagent tool
     // result (real record.result), and the parent's final answer was derived
     // from that result — not a value the test hard-coded into the parent.
     const toolResults = agentToolResults(run.parentSession);
@@ -92,13 +92,13 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     //     finishes → the child's own model turn actually runs (≥3 calls).
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     const respond = async (ctx: Context) => {
-      const isParent = (ctx.tools ?? []).some((t) => t.name === "Agent");
+      const isParent = (ctx.tools ?? []).some((t) => t.name === "subagent");
       if (!isParent) {
         await sleep(80); // child takes long enough that a non-held parent exits first
         return "CHILD_BG_RAN";
       }
       const spawned = ctx.messages.some(
-        (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
+        (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "subagent",
       );
       return spawned
         ? "summarized"
@@ -161,6 +161,48 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(toolResults[0]).not.toContain("MISSING");
     // The custom type resolved — it did NOT silently fall back to general-purpose.
     expect(toolResults[0]).not.toMatch(/Unknown agent type/i);
+  });
+
+  it("applies a JSON profile to a prompt-only Markdown agent end to end", async () => {
+    const MARKER = "JSON_PROFILE_PROMPT_REACHED_CHILD";
+    const cwd = mkdtempSync(join(tmpdir(), "subagents-json-profile-"));
+    tmpDirs.push(cwd);
+    mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(cwd, ".pi", "agents", "json-spy.md"), `${MARKER}\n`);
+    writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({
+      agents: {
+        "json-spy": {
+          description: "JSON-profiled read-only spy",
+          tools: ["read"],
+          extensions: false,
+          promptMode: "replace",
+        },
+      },
+    }));
+
+    run = await runPrintMode({
+      prompt: "Delegate to json-spy.",
+      cwd,
+      respond: routeBySession({
+        parentInitial: agentCall({
+          subagent_type: "json-spy",
+          description: "verify json profile",
+          prompt: "Report your prompt marker and tool names.",
+        }),
+        parentFinal: "Reported.",
+        subagent: (ctx: Context) => {
+          const tools = (ctx.tools ?? []).map((tool) => tool.name).sort((a, b) => a.localeCompare(b));
+          const marker = ctx.systemPrompt?.includes(MARKER) ? MARKER : "MISSING";
+          return `${marker}; tools=${tools.join(",")}`;
+        },
+      }),
+    });
+
+    const output = agentToolResults(run.parentSession).join("\n");
+    expect(output).toContain(MARKER);
+    expect(output).toContain("tools=read");
+    expect(output).not.toContain("write");
+    expect(output).not.toContain("MISSING");
   });
 
   it("spawns a FRONTMATTER-defined (.agents/agents/*.md) agent and its prompt reaches the child", async () => {
@@ -246,12 +288,12 @@ describe.runIf(LIVE)("subagents print-mode e2e (live LLM, opt-in)", () => {
     async () => {
       run = await runPrintMode({
         prompt:
-          "Use the Agent tool to spawn a general-purpose subagent (run_in_background: false) " +
+          "Use the subagent tool to spawn a general-purpose subagent (run_in_background: false) " +
           "whose only task is to reply with the exact word PONG, then tell me what it replied.",
         timeoutMs: LIVE_TIMEOUT,
       });
       expect(run.modelCalls).toBe(0); // live mode doesn't use the faux counter
-      expect(invokedToolNames(run.parentSession)).toContain("Agent");
+      expect(invokedToolNames(run.parentSession)).toContain("subagent");
       // The child actually ran and its output came back through the tool result.
       expect(agentToolResults(run.parentSession).join("\n")).toMatch(/PONG/i);
       expect(run.responseText).toMatch(/PONG/i);
@@ -286,7 +328,7 @@ describe.runIf(LIVE)("subagents print-mode e2e (live LLM, opt-in)", () => {
     async () => {
       run = await runPrintMode({
         prompt:
-          "Use the Agent tool with subagent_type 'Explore' to look at the current working " +
+          "Use the subagent tool with subagent_type 'Explore' to look at the current working " +
           "directory and report a one-line summary of what's there.",
         timeoutMs: LIVE_TIMEOUT,
       });
@@ -301,14 +343,14 @@ describe.runIf(LIVE)("subagents print-mode e2e (live LLM, opt-in)", () => {
   );
 
   it(
-    "SELF-SMOKE — the agent drives a multi-feature smoke of its own Agent toolset",
+    "SELF-SMOKE — the agent drives a multi-feature smoke of its own subagent toolset",
     async () => {
       // Agent-driven (not puppeted): one prompt, the model itself exercises three
       // Agent capabilities in a single session and self-reports. We then assert it
       // genuinely invoked each feature (not just that it claimed to in prose).
       run = await runPrintMode({
         prompt: [
-          "You are smoke-testing your own Agent toolset. Do these steps IN ORDER, then print a",
+          "You are smoke-testing your own subagent toolset. Do these steps IN ORDER, then print a",
           "final report with one PASS/FAIL line per step:",
           "1) FOREGROUND: spawn a general-purpose subagent (run_in_background: false) whose only",
           "   task is to reply with the exact token FG_OK. Confirm you got FG_OK back.",

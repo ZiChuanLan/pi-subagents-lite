@@ -63,7 +63,7 @@ export interface AgentActivity {
   lifetimeUsage: LifetimeUsage;
 }
 
-/** Metadata attached to Agent tool results for custom rendering. */
+/** Metadata attached to subagent tool results for custom rendering. */
 export interface AgentDetails {
   displayName: string;
   description: string;
@@ -168,7 +168,6 @@ export function buildInvocationTags(
   if (!invocation) return { tags };
   if (invocation.thinking) tags.push(`thinking: ${invocation.thinking}`);
   if (invocation.isolated) tags.push("isolated");
-  if (invocation.isolation === "worktree") tags.push("worktree");
   if (invocation.inheritContext) tags.push("inherit context");
   if (invocation.runInBackground) tags.push("background");
   if (invocation.maxTurns != null) tags.push(`max turns: ${invocation.maxTurns}`);
@@ -243,11 +242,9 @@ export class AgentWidget {
    * Agents eligible for the widget, per the current `WidgetMode`:
    *   - `off`: none (the widget's existing empty-state path hides it entirely).
    *   - `background`: drop only agents *known* to be foreground
-   *     (`isBackground === false`); keep everything else — background, queued,
-   *     scheduled, or RPC-spawned (`undefined`). Keying off the `isBackground`
-   *     record flag rather than the UI-only `invocation` snapshot (which only the
-   *     Agent-tool path sets), and excluding rather than allow-listing, means
-   *     only proven-foreground runs drop out — nothing else silently vanishes.
+   *     (`isBackground === false`); keep background, queued, and unspecified
+   *     internal runs. Keying off the record flag rather than the UI-only
+   *     invocation snapshot means only proven foreground runs disappear.
    *   - `all`: every agent.
    */
   private widgetAgents() {

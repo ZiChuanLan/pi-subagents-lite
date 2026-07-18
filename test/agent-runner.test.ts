@@ -9,9 +9,7 @@ const {
   loaderExtensionsRef,
   getAgentDir,
   sessionManagerInMemory,
-  sessionManagerCreate,
   settingsManagerCreate,
-  settingsManagerGetSessionDir,
 } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   defaultResourceLoaderCtor: vi.fn(),
@@ -24,9 +22,7 @@ const {
   },
   getAgentDir: vi.fn(() => "/mock/agent-dir"),
   sessionManagerInMemory: vi.fn(() => ({ kind: "memory-session-manager" })),
-  sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
-  settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
-  settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
+  settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager" })),
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
@@ -59,7 +55,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     }
   },
   getAgentDir,
-  SessionManager: { inMemory: sessionManagerInMemory, create: sessionManagerCreate },
+  SessionManager: { inMemory: sessionManagerInMemory },
   SettingsManager: { create: settingsManagerCreate },
 }));
 
@@ -70,7 +66,6 @@ vi.mock("../src/agent-types.js", () => ({
     description: "Explore",
     builtinToolNames: ["read"],
     extensions: false,
-    skills: false,
     promptMode: "replace",
   })),
   getAgentConfig: vi.fn(() => ({
@@ -78,15 +73,12 @@ vi.mock("../src/agent-types.js", () => ({
     description: "Explore",
     builtinToolNames: ["read"],
     extensions: false,
-    skills: false,
     systemPrompt: "You are Explore.",
     promptMode: "replace",
     inheritContext: false,
     runInBackground: false,
     isolated: false,
   })),
-  getMemoryToolNames: vi.fn(() => []),
-  getReadOnlyMemoryToolNames: vi.fn(() => []),
   getToolNamesForType: vi.fn(() => ["read"]),
 }));
 
@@ -96,15 +88,6 @@ vi.mock("../src/env.js", () => ({
 
 vi.mock("../src/prompts.js", () => ({
   buildAgentPrompt: vi.fn(() => "system prompt"),
-}));
-
-vi.mock("../src/memory.js", () => ({
-  buildMemoryBlock: vi.fn(() => ""),
-  buildReadOnlyMemoryBlock: vi.fn(() => ""),
-}));
-
-vi.mock("../src/skill-loader.js", () => ({
-  preloadSkills: vi.fn(() => []),
 }));
 
 import {
@@ -156,9 +139,6 @@ beforeEach(() => {
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
   sessionManagerInMemory.mockClear();
-  sessionManagerCreate.mockClear();
-  settingsManagerGetSessionDir.mockReset();
-  settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
 });
@@ -659,7 +639,6 @@ function makeAgentConfig(overrides: Record<string, unknown> = {}) {
     description: "Test",
     builtinToolNames: BUILTINS_7,
     extensions: true as boolean | string[],
-    skills: false as boolean | string[],
     systemPrompt: "Test.",
     promptMode: "replace" as const,
     inheritContext: false,
@@ -675,7 +654,6 @@ function makeConfig(overrides: Record<string, unknown> = {}) {
     description: "Test",
     builtinToolNames: BUILTINS_7,
     extensions: true as boolean | string[],
-    skills: false as boolean | string[],
     promptMode: "replace" as const,
     ...overrides,
   };
@@ -710,41 +688,9 @@ describe("agent-runner session persistence", () => {
     await runAgent(ctx, "Explore", "go", { pi });
 
     expect(sessionManagerInMemory).toHaveBeenCalledWith("/tmp");
-    expect(sessionManagerCreate).not.toHaveBeenCalled();
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       sessionManager: { kind: "memory-session-manager" },
     }));
-  });
-
-  it("uses pi's normal persistent session location when persistSession is true", async () => {
-    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
-    settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");
-    const { session } = createSession("OK");
-    createAgentSession.mockResolvedValue({ session });
-
-    await runAgent(ctx, "Explore", "go", { pi });
-
-    expect(sessionManagerInMemory).not.toHaveBeenCalled();
-    expect(sessionManagerCreate).toHaveBeenCalledWith("/tmp", "/normal/pi/sessions");
-    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
-      sessionManager: { kind: "persistent-session-manager" },
-    }));
-  });
-
-  it("uses a frontmatter sessionDir when persistSession is true and sessionDir is configured", async () => {
-    vi.mocked(getAgentConfig).mockReturnValueOnce(
-      makeAgentConfig({ persistSession: true, sessionDir: ".seams/pi-sessions/seam-plan-reviewer" }),
-    );
-    settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");
-    const { session } = createSession("OK");
-    createAgentSession.mockResolvedValue({ session });
-
-    await runAgent(ctx, "Explore", "go", { pi, cwd: "/repo" });
-
-    expect(sessionManagerCreate).toHaveBeenCalledWith(
-      "/repo",
-      "/repo/.seams/pi-sessions/seam-plan-reviewer",
-    );
   });
 });
 
@@ -805,7 +751,7 @@ describe("agent-runner master tool allowlist", () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true }));
     vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
     withExtensions({
-      "/ext/evil.ts": ["Agent", "get_subagent_result", "steer_subagent", "ok_ext"],
+      "/ext/evil.ts": ["subagent", "get_subagent_result", "steer_subagent", "ok_ext"],
     });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
@@ -813,7 +759,7 @@ describe("agent-runner master tool allowlist", () => {
     await runAgent(ctx, "Explore", "go", { pi });
 
     const tools = lastToolsPassed();
-    expect(tools).not.toContain("Agent");
+    expect(tools).not.toContain("subagent");
     expect(tools).not.toContain("get_subagent_result");
     expect(tools).not.toContain("steer_subagent");
     expect(tools).toContain("ok_ext");
@@ -835,7 +781,7 @@ describe("agent-runner master tool allowlist", () => {
     expect(tools).toEqual(BUILTINS_7.filter((t) => t !== "bash"));
   });
 
-  it("does not call setActiveToolsByName post-construction (gating is at construction)", async () => {
+  it("preserves policy narrowing after extension binding", async () => {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(
       makeAgentConfig({ extensions: true, disallowedTools: ["bash"] }),
@@ -843,11 +789,12 @@ describe("agent-runner master tool allowlist", () => {
     vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
     withExtensions({ "/ext/mcp.ts": ["mcp"] });
     const { session } = createSession("OK");
+    session.getActiveToolNames.mockReturnValue(["read", "write", "outside-policy"]);
     createAgentSession.mockResolvedValue({ session });
 
     await runAgent(ctx, "Explore", "go", { pi });
 
-    expect(session.setActiveToolsByName).not.toHaveBeenCalled();
+    expect(session.setActiveToolsByName).toHaveBeenCalledWith(["read", "write"]);
   });
 });
 
@@ -892,8 +839,8 @@ describe("extensionCanonicalNames (#143 — package short name alias)", () => {
 
   it("aliases a package-declared index.ts entry to the unscoped, lowercased package name", () => {
     // Without this, `pi.extensions: ["./src/index.ts"]` only ever matches as "src".
-    const dir = pkgDir("@tintinweb/Pi-Subagents", ["./src/index.ts"]);
-    expect(extensionCanonicalNames(join(dir, "src", "index.ts"))).toEqual(["src", "pi-subagents"]);
+    const dir = pkgDir("@lan-local/Pi-Subagents-Lite", ["./src/index.ts"]);
+    expect(extensionCanonicalNames(join(dir, "src", "index.ts"))).toEqual(["src", "pi-subagents-lite"]);
   });
 
   it("adds no alias for a loose file with no enclosing package.json", () => {
@@ -1023,13 +970,13 @@ describe("agent-runner extension allowlist", () => {
     try {
       writeFileSync(
         join(dir, "package.json"),
-        JSON.stringify({ name: "@tintinweb/pi-subagents", pi: { extensions: ["./src/index.ts"] } }),
+        JSON.stringify({ name: "@lan-local/pi-subagents-lite", pi: { extensions: ["./src/index.ts"] } }),
       );
       mkdirSync(join(dir, "src"));
       writeFileSync(join(dir, "src", "index.ts"), "export default () => {};");
       const entry = join(dir, "src", "index.ts");
 
-      setupArrayAgent(["pi-subagents"]);
+      setupArrayAgent(["pi-subagents-lite"]);
       withExtensions({ [entry]: ["pkg_tool"] });
       const { session } = createSession("OK");
       createAgentSession.mockResolvedValue({ session });

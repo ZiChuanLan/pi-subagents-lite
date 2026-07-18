@@ -16,10 +16,10 @@ import {
   runPrintMode,
 } from "./helpers/print-mode-runner.js";
 
-/** Text of the parent's Agent tool result — what the orchestrator LLM sees. */
+/** Text of the parent's subagent tool result — what the orchestrator LLM sees. */
 function agentToolResult(session: AgentSession): string {
   const msg = [...session.messages].reverse().find(
-    (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
+    (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "subagent",
   );
   return ((msg?.content ?? []) as Array<{ text?: string }>).map((b) => b.text ?? "").join("");
 }

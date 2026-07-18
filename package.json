@@ -1,16 +1,16 @@
 {
-  "name": "@tintinweb/pi-subagents",
-  "version": "0.14.2",
-  "description": "A pi extension extension that brings smart Claude Code-style autonomous sub-agents to pi.",
-  "author": "tintinweb",
+  "name": "@lan-local/pi-subagents-lite",
+  "version": "0.1.0",
+  "description": "A streamlined Pi subagent runtime with FleetView, live conversations, and JSON agent profiles.",
+  "author": "Lan (fork), tintinweb (original)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tintinweb/pi-subagents.git"
+    "url": "git+https://github.com/ZiChuanLan/pi-subagents-lite.git"
   },
-  "homepage": "https://github.com/tintinweb/pi-subagents#readme",
+  "homepage": "https://github.com/ZiChuanLan/pi-subagents-lite#readme",
   "bugs": {
-    "url": "https://github.com/tintinweb/pi-subagents/issues"
+    "url": "https://github.com/ZiChuanLan/pi-subagents-lite/issues"
   },
   "keywords": [
     "pi-package",
@@ -20,22 +20,27 @@
     "agent",
     "autonomous"
   ],
+  "files": [
+    "src",
+    "README.md",
+    "FORK_NOTES.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.80.0",
     "@earendil-works/pi-coding-agent": ">=0.80.0",
     "@earendil-works/pi-tui": ">=0.80.0"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.49",
-    "croner": "^10.0.1",
-    "nanoid": "^5.0.0"
+    "@sinclair/typebox": "^0.34.49"
   },
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "vitest run e2e --reporter=verbose",
+    "test:e2e": "vitest run test/*-e2e.test.ts test/e2e/*.e2e.test.ts --reporter=verbose",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/ test/",
     "lint:fix": "biome check --fix src/ test/"
@@ -49,8 +54,6 @@
   "pi": {
     "extensions": [
       "./src/index.ts"
-    ],
-    "video": "https://github.com/tintinweb/pi-subagents/raw/master/media/demo.mp4",
-    "image": "https://github.com/tintinweb/pi-subagents/raw/master/media/screenshot.png"
+    ]
   }
 }

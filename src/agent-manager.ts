@@ -12,9 +12,8 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentInvocation, AgentRecord, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
-import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -27,8 +26,7 @@ const DEFAULT_MAX_CONCURRENT = 4;
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
  * (parent cwd). Anything else must be an absolute path to an existing
- * directory — curated errors instead of TypeErrors from path/fs internals
- * (RPC callers send arbitrary JSON: null, numbers, file paths).
+ * directory — curated errors instead of TypeErrors from path/fs internals.
  */
 function assertValidSpawnCwd(cwd: unknown): asserts cwd is string | undefined | null {
   if (cwd == null) return;
@@ -63,20 +61,9 @@ interface SpawnOptions {
   thinkingLevel?: ThinkingLevel;
   isBackground?: boolean;
   /**
-   * Skip the maxConcurrent queue check for this spawn — start immediately even
-   * if the configured concurrency limit would otherwise queue it. Used by the
-   * scheduler so a fired job can't be deferred past its trigger window.
-   */
-  bypassQueue?: boolean;
-  /** Isolation mode — "worktree" creates a temp git worktree for the agent. */
-  isolation?: IsolationMode;
-  /**
    * Working directory for the agent (absolute path). Default: parent session
-   * cwd. The agent's tools operate here, but .pi config (extensions, skills,
-   * settings, memory) still loads from the parent session's project — the
-   * target directory's `.pi` extensions never execute. With isolation:
-   * "worktree", the worktree is created FROM this directory and the result
-   * branch lands in that repo.
+   * cwd. The agent's tools operate here, while Pi configuration remains anchored
+   * to the parent project so the target directory's `.pi` extensions do not load.
    */
   cwd?: string;
   /** Resolved invocation snapshot captured for UI display. */
@@ -104,10 +91,6 @@ export class AgentManager {
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
   private maxConcurrent: number;
-  /** Base repos worktrees were created from — so dispose() can prune them all,
-   *  not just the parent repo (caller-supplied cwd can target other repos). */
-  private worktreeRepos = new Set<string>();
-
   /** Queue of background agents waiting to start. */
   private queue: { id: string; args: SpawnArgs }[] = [];
   /** Number of currently running background agents. */
@@ -151,8 +134,7 @@ export class AgentManager {
     options: SpawnOptions,
   ): string {
     // Validate before the queue branch — a queued spawn should fail at the
-    // call, not minutes later at drain. Throw (not warn): programmatic callers
-    // can fix and retry; the RPC layer converts throws into error envelopes.
+    // call, not minutes later when the queue drains.
     assertValidSpawnCwd(options.cwd);
 
     const id = randomUUID().slice(0, 17);
@@ -168,10 +150,8 @@ export class AgentManager {
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
       compactionCount: 0,
       // Raw tri-state (not coerced to a boolean): true = background, false =
-      // foreground (has an inline tool-result surface), undefined = caller never
-      // declared it (e.g. a cross-extension RPC spawn). The widget's background-
-      // only filter excludes only explicit `false`, so undefined agents — which
-      // have no inline surface — stay visible instead of vanishing.
+      // foreground (has an inline tool-result surface), undefined = an internal
+      // caller omitted the mode. The widget hides only explicit foreground runs.
       isBackground: options.isBackground,
       invocation: options.invocation,
     };
@@ -179,14 +159,14 @@ export class AgentManager {
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
 
-    if (options.isBackground && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
+    if (options.isBackground && this.runningBackground >= this.maxConcurrent) {
       // Queue it — will be started when a running agent completes
       this.queue.push({ id, args });
       return id;
     }
 
-    // startAgent can throw (e.g. strict worktree-isolation failure) — clean
-    // up the record so callers don't see an orphan in `listAgents()`.
+    // startAgent can throw during validation/setup — clean up the record so
+    // callers do not see an orphan in `listAgents()`.
     try {
       this.startAgent(id, record, args);
     } catch (err) {
@@ -202,33 +182,7 @@ export class AgentManager {
     // spawn()'s check, and the directory may be gone by then (TOCTOU). Same
     // curated errors; drainQueue parks a throw on the record as an error.
     assertValidSpawnCwd(options.cwd);
-    // Single resolution point for the caller-supplied cwd — the worktree base
-    // repo and both cleanup calls below MUST agree on this value forever.
-    const customCwd = options.cwd ?? undefined; // null (RPC "unset") → undefined
-    const baseCwd = customCwd ?? ctx.cwd;
-
-    // Worktree isolation: try to create a temporary git worktree. Strict —
-    // fail loud if not possible (no silent fallback to main tree). Done
-    // BEFORE state mutation so a throw doesn't leave the record half-running.
-    let worktreeCwd: string | undefined;
-    if (options.isolation === "worktree") {
-      const wt = createWorktree(baseCwd, id);
-      if (!wt) {
-        throw new Error(
-          'Cannot run with isolation: "worktree" — not a git repo, no commits yet, or `git worktree add` failed. ' +
-          'Initialize git and commit at least once, or omit `isolation`.',
-        );
-      }
-      record.worktree = wt;
-      // workPath preserves subdirectory scoping for caller-supplied cwds: a
-      // cwd deep in a monorepo maps to the same subdir inside the copy, not
-      // the copied repo's root. Plain worktree spawns keep the historical
-      // behavior (agent at the copy's root) — moving them to workPath would
-      // also move .pi config discovery when the parent session sits in a repo
-      // subdirectory, silently dropping extensions/skills.
-      worktreeCwd = customCwd !== undefined ? wt.workPath : wt.path;
-      this.worktreeRepos.add(baseCwd);
-    }
+    const customCwd = options.cwd ?? undefined;
 
     record.status = "running";
     record.startedAt = Date.now();
@@ -252,12 +206,7 @@ export class AgentManager {
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
-      // Worktree wins for the working dir (the agent must run in the copy —
-      // which, with a custom cwd, was created from that target). Config stays
-      // with the parent project when a caller-supplied cwd is in play; it must
-      // stay undefined otherwise so plain worktree runs keep resolving config
-      // (incl. relative extension paths and memory) inside the worktree copy.
-      cwd: worktreeCwd ?? customCwd,
+      cwd: customCwd,
       configCwd: customCwd !== undefined ? ctx.cwd : undefined,
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
@@ -276,6 +225,10 @@ export class AgentManager {
         options.onCompaction?.(info);
       },
       onSessionCreated: (session) => {
+        if (this.agents.get(id) !== record) {
+          session.dispose?.();
+          return;
+        }
         record.session = session;
         // Flush any steers that arrived before the session was ready
         if (record.pendingSteers?.length) {
@@ -303,7 +256,8 @@ export class AgentManager {
           }
         }
         record.result = responseText;
-        record.session = session;
+        if (this.agents.get(id) === record) record.session = session;
+        else session.dispose?.();
         record.completedAt ??= Date.now();
 
         detach();
@@ -314,28 +268,19 @@ export class AgentManager {
           record.outputCleanup = undefined;
         }
 
-        // Clean up worktree if used
-        if (record.worktree) {
-          const wtResult = cleanupWorktree(baseCwd, record.worktree, options.description);
-          record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch) {
-            // With a caller-supplied cwd the branch lives in THAT repo, not the
-            // parent session's — say so, or the orchestrator merges in the wrong repo.
-            const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
-            record.result = (record.result ?? "") +
-              `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
-          }
-        }
 
-        // Fire onComplete for foreground agents too — lifecycle symmetry.
-        // Mark resultConsumed so the callback skips notifications (result returned inline).
-        if (!options.isBackground) {
-          record.resultConsumed = true;
-          try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-        } else {
-          this.runningBackground--;
-          try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-          this.drainQueue();
+        // A session reset may have removed this record while the run was
+        // aborting. Late completions must not touch the replacement session's
+        // callbacks, queue, or concurrency counters.
+        if (this.agents.get(id) === record) {
+          if (!options.isBackground) {
+            record.resultConsumed = true;
+            try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+          } else {
+            this.runningBackground--;
+            try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+            this.drainQueue();
+          }
         }
         return responseText;
       })
@@ -355,23 +300,16 @@ export class AgentManager {
           record.outputCleanup = undefined;
         }
 
-        // Best-effort worktree cleanup on error
-        if (record.worktree) {
-          try {
-            const wtResult = cleanupWorktree(baseCwd, record.worktree, options.description);
-            record.worktreeResult = wtResult;
-          } catch { /* ignore cleanup errors */ }
-        }
 
-        // Fire onComplete for foreground agents too — lifecycle symmetry.
-        // Mark resultConsumed so the callback skips notifications (result returned inline).
-        if (!options.isBackground) {
-          record.resultConsumed = true;
-          this.onComplete?.(record);
-        } else {
-          this.runningBackground--;
-          this.onComplete?.(record);
-          this.drainQueue();
+        if (this.agents.get(id) === record) {
+          if (!options.isBackground) {
+            record.resultConsumed = true;
+            this.onComplete?.(record);
+          } else {
+            this.runningBackground--;
+            this.onComplete?.(record);
+            this.drainQueue();
+          }
         }
         return "";
       });
@@ -393,8 +331,7 @@ export class AgentManager {
       try {
         this.startAgent(next.id, record, next.args);
       } catch (err) {
-        // Late failure (e.g. strict worktree-isolation) — surface on the record
-        // so the user/agent can see it via /agents, then keep draining.
+        // Surface late setup failures on the record, then keep draining.
         record.status = "error";
         record.error = err instanceof Error ? err.message : String(err);
         record.completedAt = Date.now();
@@ -450,38 +387,66 @@ export class AgentManager {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
 
+    const abortController = new AbortController();
+    record.abortController = abortController;
     record.status = "running";
     record.startedAt = Date.now();
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    record.resultConsumed = false;
+    this.onStart?.(record);
 
-    try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
-        onToolActivity: (activity) => {
-          if (activity.type === "end") record.toolUses++;
-        },
-        onAssistantUsage: (usage) => {
-          addUsage(record.lifetimeUsage, usage);
-        },
-        onCompaction: (info) => {
-          record.compactionCount++;
-          this.onCompact?.(record, info);
-        },
-        signal,
-      });
-      // Same contract as the spawn path (#144): a failed final turn is an
-      // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
-      record.result = text;
-      record.completedAt = Date.now();
-    } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
+    let detachParentSignal: (() => void) | undefined;
+    if (signal) {
+      const onParentAbort = () => this.abort(id);
+      if (signal.aborted) onParentAbort();
+      else {
+        signal.addEventListener("abort", onParentAbort, { once: true });
+        detachParentSignal = () => signal.removeEventListener("abort", onParentAbort);
+      }
     }
 
+    const promise = resumeAgent(record.session, prompt, {
+      onToolActivity: (activity) => {
+        if (activity.type === "end") record.toolUses++;
+      },
+      onAssistantUsage: (usage) => {
+        addUsage(record.lifetimeUsage, usage);
+      },
+      onCompaction: (info) => {
+        record.compactionCount++;
+        this.onCompact?.(record, info);
+      },
+      signal: abortController.signal,
+    })
+      .then(({ text, failure }) => {
+        if (record.status !== "stopped") {
+          record.status = failure ? "error" : "completed";
+          if (failure) record.error = failure;
+        }
+        record.result = text;
+        record.completedAt ??= Date.now();
+        return text;
+      })
+      .catch((err) => {
+        if (record.status !== "stopped") {
+          record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
+        }
+        record.completedAt ??= Date.now();
+        return "";
+      })
+      .finally(() => {
+        detachParentSignal?.();
+        record.resultConsumed = true;
+        if (this.agents.get(id) === record) {
+          try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+        }
+      });
+
+    record.promise = promise;
+    await promise;
     return record;
   }
 
@@ -535,8 +500,12 @@ export class AgentManager {
     return true;
   }
 
-  /** Dispose a record's session and remove it from the map. */
+  /** Dispose a record's session/output stream and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
+    if (record.outputCleanup) {
+      try { record.outputCleanup(); } catch { /* ignore cleanup errors */ }
+      record.outputCleanup = undefined;
+    }
     record.session?.dispose?.();
     record.session = undefined;
     this.agents.delete(id);
@@ -597,6 +566,14 @@ export class AgentManager {
     return count;
   }
 
+  /** Reset all records and counters while keeping this manager reusable. */
+  reset(): void {
+    this.abortAll();
+    this.queue = [];
+    this.runningBackground = 0;
+    for (const [id, record] of this.agents) this.removeRecord(id, record);
+  }
+
   /** Wait for all running and queued agents to complete (including queued ones). */
   async waitForAll(): Promise<void> {
     // Loop because drainQueue respects the concurrency limit — as running
@@ -614,18 +591,6 @@ export class AgentManager {
 
   dispose() {
     clearInterval(this.cleanupInterval);
-    // Clear queue
-    this.queue = [];
-    for (const record of this.agents.values()) {
-      record.session?.dispose();
-    }
-    this.agents.clear();
-    // Prune any orphaned git worktrees (crash recovery)
-    try { pruneWorktrees(process.cwd()); } catch { /* ignore */ }
-    // Also prune repos that caller-supplied cwds created worktrees in — a clean
-    // exit with in-flight agents would otherwise leave stale registrations there.
-    for (const repo of this.worktreeRepos) {
-      try { pruneWorktrees(repo); } catch { /* ignore */ }
-    }
+    this.reset();
   }
 }

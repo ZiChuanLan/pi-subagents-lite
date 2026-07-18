@@ -177,7 +177,7 @@ export function agentCall(
   },
   opts?: { id?: string },
 ): ToolCall {
-  return fauxToolCall("Agent", { subagent_type: "general-purpose", ...args }, opts);
+  return fauxToolCall("subagent", { subagent_type: "general-purpose", ...args }, opts);
 }
 
 function resolveReply(
@@ -202,10 +202,10 @@ export function routeBySession(routes: {
   subagent: FauxReply | ((ctx: Context) => FauxReply);
 }): FauxResponder {
   return (context) => {
-    const isParent = (context.tools ?? []).some((t) => t.name === "Agent");
+    const isParent = (context.tools ?? []).some((t) => t.name === "subagent");
     if (!isParent) return resolveReply(routes.subagent, context);
     const spawned = context.messages.some(
-      (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
+      (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "subagent",
     );
     if (spawned) {
       return routes.parentFinal != null
@@ -232,7 +232,7 @@ function toAssistantMessage(reply: FauxReply): AssistantMessage {
 // --------------------------------------------------------------------------
 
 const DEFAULT_SYSTEM_PROMPT =
-  "You are a headless orchestrator. Use the Agent tool to delegate, then report the result.";
+  "You are a headless orchestrator. Use the subagent tool to delegate, then report the result.";
 
 function isLive(options: RunPrintModeOptions): boolean {
   return Boolean(options.live) || /^(1|true|yes)$/i.test(process.env.PI_E2E_LIVE ?? "");
@@ -524,7 +524,7 @@ export function agentToolResults(session: AgentSession): string[] {
   const out: string[] = [];
   for (const msg of session.messages) {
     if (msg.role !== "toolResult") continue;
-    if ((msg as { toolName?: string }).toolName !== "Agent") continue;
+    if ((msg as { toolName?: string }).toolName !== "subagent") continue;
     const text = (msg.content as Array<{ type?: string; text?: string }>)
       .map((b) => (b.type === "text" ? (b.text ?? "") : ""))
       .join("");
@@ -573,7 +573,7 @@ export function agentToolCalls(session: AgentSession): Array<Record<string, unkn
   for (const msg of session.messages) {
     if (msg.role !== "assistant") continue;
     for (const block of msg.content as Array<{ type?: string; name?: string; arguments?: unknown }>) {
-      if (block.type === "toolCall" && block.name === "Agent") {
+      if (block.type === "toolCall" && block.name === "subagent") {
         out.push((block.arguments ?? {}) as Record<string, unknown>);
       }
     }

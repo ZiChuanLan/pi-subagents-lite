@@ -17,13 +17,11 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getToolNamesForType } from "./agent-types.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
-import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
-import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
-import { preloadSkills } from "./skill-loader.js";
+import { buildAgentPrompt } from "./prompts.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 
 /**
@@ -33,7 +31,7 @@ import type { SubagentType, ThinkingLevel } from "./types.js";
  * derived from pi — but they only need defining once.
  */
 export const SUBAGENT_TOOL_NAMES = {
-  AGENT: "Agent",
+  AGENT: "subagent",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
 } as const;
@@ -72,8 +70,8 @@ export function extensionCanonicalName(extPath: string): string {
  * The name is then taken only when that root's `pi.extensions` manifest actually
  * lists this entry. That "declares this entry" check is deliberate: our own test
  * fixtures live under this repo, whose root manifest declares `./src/index.ts`
- * as `@tintinweb/pi-subagents`, so a looser rule would misattribute every
- * co-located file to `pi-subagents`.
+ * as `@lan-local/pi-subagents-lite`, so a looser rule would misattribute every
+ * co-located file to this package.
  */
 function extensionPackageName(extPath: string): string | undefined {
   const entry = resolve(extPath);
@@ -267,20 +265,12 @@ export interface RunOptions {
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
-  /** Override working directory (e.g. for worktree isolation). */
+  /** Optional alternate working directory. */
   cwd?: string;
   /**
-   * Where .pi config is discovered (project extensions, skills, pi settings,
-   * agent memory). Default: same as the working directory. The manager sets
-   * this to the parent session's cwd when `SpawnOptions.cwd` points the
-   * working directory elsewhere — the agent works *there* but carries the
-   * parent project's config (the target's `.pi` extensions never execute).
-   *
-   * WARNING for future callers: if you pass `cwd` pointing at a directory the
-   * user didn't open, you almost certainly must pass `configCwd` too —
-   * omitting it makes the target's `.pi` extensions execute in this process.
-   * (Worktree isolation is the one intentional exception: its copy IS the
-   * parent's repo, so config resolving inside it is correct.)
+   * Where Pi configuration is discovered. Default: the working directory.
+   * AgentManager anchors this to the parent session when `cwd` points elsewhere,
+   * so the target directory's `.pi` extensions do not execute unexpectedly.
    */
   configCwd?: string;
   /** Called on tool start/end with activity info. */
@@ -395,15 +385,12 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
   const onAbort = () => session.abort();
+  if (signal.aborted) {
+    onAbort();
+    return () => {};
+  }
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
-}
-
-function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string): string | undefined {
-  if (!sessionDir) return undefined;
-  if (sessionDir === "~" || sessionDir.startsWith("~/")) return resolve(homedir(), sessionDir.slice(2));
-  if (isAbsolute(sessionDir)) return sessionDir;
-  return resolve(cwd, sessionDir);
 }
 
 export async function runAgent(
@@ -415,7 +402,7 @@ export async function runAgent(
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
 
-  // Resolve working directory: worktree override > parent cwd
+  // Resolve working directory override, otherwise inherit the parent cwd.
   const effectiveCwd = options.cwd ?? ctx.cwd;
   // Filesystem work happens in effectiveCwd; config discovery in configCwd.
   // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
@@ -426,62 +413,21 @@ export async function runAgent(
   // Get parent system prompt for append-mode agents
   const parentSystemPrompt = ctx.getSystemPrompt();
 
-  // Build prompt extras (memory, skill preloading)
-  const extras: PromptExtras = {};
-
-  // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;
-  // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
-  // isolation is an intentional override, not a misconfiguration.
   const excludeExtensions = options.isolated ? undefined : config.excludeExtensions;
-  const skills = options.isolated ? false : config.skills;
-
-  // Skill preloading: when skills is string[], preload their content into prompt
-  if (Array.isArray(skills)) {
-    const loaded = preloadSkills(skills, configCwd);
-    if (loaded.length > 0) {
-      extras.skillBlocks = loaded;
-    }
-  }
-
-  let toolNames = getToolNamesForType(type);
-
-  // Persistent memory: detect write capability and branch accordingly.
-  // Account for disallowedTools — a tool in the base set but on the denylist is not truly available.
-  if (agentConfig?.memory) {
-    const existingNames = new Set(toolNames);
-    const denied = agentConfig.disallowedTools ? new Set(agentConfig.disallowedTools) : undefined;
-    const effectivelyHas = (name: string) => existingNames.has(name) && !denied?.has(name);
-    const hasWriteTools = effectivelyHas("write") || effectivelyHas("edit");
-
-    if (hasWriteTools) {
-      // Read-write memory: add any missing memory tool names (read/write/edit)
-      const extraNames = getMemoryToolNames(existingNames);
-      if (extraNames.length > 0) toolNames = [...toolNames, ...extraNames];
-      extras.memoryBlock = buildMemoryBlock(agentConfig.name, agentConfig.memory, configCwd);
-    } else {
-      // Read-only memory: only add read tool name, use read-only prompt
-      const extraNames = getReadOnlyMemoryToolNames(existingNames);
-      if (extraNames.length > 0) toolNames = [...toolNames, ...extraNames];
-      extras.memoryBlock = buildReadOnlyMemoryBlock(agentConfig.name, agentConfig.memory, configCwd);
-    }
-  }
+  const toolNames = getToolNamesForType(type);
 
   // Build system prompt from agent config
   let systemPrompt: string;
   if (agentConfig) {
-    systemPrompt = buildAgentPrompt(agentConfig, effectiveCwd, env, parentSystemPrompt, extras);
+    systemPrompt = buildAgentPrompt(agentConfig, effectiveCwd, env, parentSystemPrompt);
   } else {
     // Unknown type fallback: spread the canonical general-purpose config (defensive —
     // unreachable in practice since index.ts resolves unknown types before calling runAgent).
     const fallback = DEFAULT_AGENTS.get("general-purpose");
     if (!fallback) throw new Error(`No fallback config available for unknown type "${type}"`);
-    systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, parentSystemPrompt, extras);
+    systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, parentSystemPrompt);
   }
-
-  // When skills is string[], we've already preloaded them into the prompt.
-  // Still pass noSkills: true since we don't need the skill loader to load them again.
-  const noSkills = skills === false || Array.isArray(skills);
 
   const agentDir = getAgentDir();
 
@@ -547,7 +493,7 @@ export async function runAgent(
     noExtensions,
     additionalExtensionPaths,
     extensionsOverride,
-    noSkills,
+    noSkills: options.isolated,
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
@@ -676,11 +622,7 @@ export async function runAgent(
   });
 
   const settingsManager = SettingsManager.create(configCwd, agentDir);
-  const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
-  const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
-  const sessionManager = agentConfig?.persistSession
-    ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
-    : SessionManager.inMemory(effectiveCwd);
+  const sessionManager = SessionManager.inMemory(effectiveCwd);
 
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
@@ -711,10 +653,10 @@ export async function runAgent(
     options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
   );
 
-  // Bind extensions so that session_start fires and extensions can initialize
-  // (e.g. loading credentials, setting up state). Tool gating already happened
-  // at session construction via the `tools:` allowlist above — no separate
-  // post-bind filter is needed. All ExtensionBindings fields are optional.
+  // Bind child extensions so their session_start hooks can initialize. A policy
+  // extension may intentionally narrow the active tool set during binding, so
+  // never restore the full agent allowlist afterwards. Re-apply only the
+  // intersection of the policy-selected active tools and this agent's allowlist.
   await session.bindExtensions({
     onError: (err) => {
       options.onToolActivity?.({
@@ -723,6 +665,9 @@ export async function runAgent(
       });
     },
   });
+  const allowedSet = new Set(allowedTools);
+  const activeAfterBind = session.getActiveToolNames().filter((name) => allowedSet.has(name));
+  session.setActiveToolsByName(activeAfterBind);
 
   options.onSessionCreated?.(session);
 
