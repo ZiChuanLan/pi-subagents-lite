@@ -1,4 +1,4 @@
-# @lan-local/pi-subagents-lite
+# @zichuanlan/pi-subagents-lite
 
 A streamlined Pi subagent package focused on execution and observability.
 
