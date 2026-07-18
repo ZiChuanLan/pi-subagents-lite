@@ -51,7 +51,7 @@ Pi 0.80.10 accepts a bare local path here; it does not accept npm-style `file:/h
 After publishing to an npm scope you control:
 
 ```bash
-pi install npm:@lan-local/pi-subagents-lite
+pi install npm:@zichuanlan/pi-subagents-lite
 ```
 
 The repository can live anywhere, including a WSL path. Publishing depends on npm authentication and ownership of the package scope, not on the filesystem location.
