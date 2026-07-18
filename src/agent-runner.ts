@@ -70,7 +70,7 @@ export function extensionCanonicalName(extPath: string): string {
  * The name is then taken only when that root's `pi.extensions` manifest actually
  * lists this entry. That "declares this entry" check is deliberate: our own test
  * fixtures live under this repo, whose root manifest declares `./src/index.ts`
- * as `@lan-local/pi-subagents-lite`, so a looser rule would misattribute every
+ * as `@zichuanlan/pi-subagents-lite`, so a looser rule would misattribute every
  * co-located file to this package.
  */
 function extensionPackageName(extPath: string): string | undefined {

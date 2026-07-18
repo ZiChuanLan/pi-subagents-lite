@@ -839,7 +839,7 @@ describe("extensionCanonicalNames (#143 — package short name alias)", () => {
 
   it("aliases a package-declared index.ts entry to the unscoped, lowercased package name", () => {
     // Without this, `pi.extensions: ["./src/index.ts"]` only ever matches as "src".
-    const dir = pkgDir("@lan-local/Pi-Subagents-Lite", ["./src/index.ts"]);
+    const dir = pkgDir("@zichuanlan/Pi-Subagents-Lite", ["./src/index.ts"]);
     expect(extensionCanonicalNames(join(dir, "src", "index.ts"))).toEqual(["src", "pi-subagents-lite"]);
   });
 
@@ -970,7 +970,7 @@ describe("agent-runner extension allowlist", () => {
     try {
       writeFileSync(
         join(dir, "package.json"),
-        JSON.stringify({ name: "@lan-local/pi-subagents-lite", pi: { extensions: ["./src/index.ts"] } }),
+        JSON.stringify({ name: "@zichuanlan/pi-subagents-lite", pi: { extensions: ["./src/index.ts"] } }),
       );
       mkdirSync(join(dir, "src"));
       writeFileSync(join(dir, "src", "index.ts"), "export default () => {};");

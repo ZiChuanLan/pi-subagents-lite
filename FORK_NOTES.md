@@ -2,7 +2,7 @@
 
 ## Origin
 
-`@lan-local/pi-subagents-lite` is a streamlined fork of [`tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents), based on upstream v0.14.2.
+`@zichuanlan/pi-subagents-lite` is a streamlined fork of [`tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents), based on upstream v0.14.2.
 
 The fork was created to keep tintinweb's strong subagent observability—FleetView, the live conversation viewer, steering, stopping, resuming, and rich status rendering—without carrying unrelated scheduling, persistence, worktree, and RPC subsystems.
 
@@ -10,12 +10,12 @@ The fork was created to keep tintinweb's strong subagent observability—FleetVi
 
 - Repository directory: `/home/lan/workspace/pi-subagents-lite`
 - Default branch: `main`
-- Package name: `@lan-local/pi-subagents-lite`
+- Package name: `@zichuanlan/pi-subagents-lite`
 - Initial fork version: `0.1.0`
 - Pi extension entry: `src/index.ts`
 - Primary tool name: `subagent`
 
-The scoped npm name is intentionally local for development. A future public publish requires npm authentication and control of the selected scope; the repository's WSL path does not prevent publishing.
+The public npm package uses the `@zichuanlan` user scope. The repository's WSL path does not prevent publishing.
 
 ## Retained architecture
 

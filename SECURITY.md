@@ -1,6 +1,6 @@
 # Security Policy
 
-`@lan-local/pi-subagents-lite` is a Pi extension that launches child agents inside the same local-user security boundary as the parent Pi process.
+`@zichuanlan/pi-subagents-lite` is a Pi extension that launches child agents inside the same local-user security boundary as the parent Pi process.
 
 ## Security model
 

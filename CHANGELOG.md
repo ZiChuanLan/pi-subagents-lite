@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `@lan-local/pi-subagents-lite` are documented here.
+All notable changes to `@zichuanlan/pi-subagents-lite` are documented here.
 
 ## [Unreleased]
 

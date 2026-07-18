@@ -2,7 +2,7 @@
 
 ## Scope
 
-`@lan-local/pi-subagents-lite` is a balanced-lite fork. Keep execution and observability; do not casually restore removed subsystems.
+`@zichuanlan/pi-subagents-lite` is a balanced-lite fork. Keep execution and observability; do not casually restore removed subsystems.
 
 Retained: foreground/background execution, queues, FleetView, live conversation viewer, steer/stop/resume, notifications, context inheritance, transcripts, custom agents, and observation events.
 

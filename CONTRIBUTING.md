@@ -1,4 +1,4 @@
-# Contributing to @lan-local/pi-subagents-lite
+# Contributing to @zichuanlan/pi-subagents-lite
 
 This fork is intentionally narrow: preserve a strong child-agent execution and observability experience without reintroducing the removed scheduler, memory, skill-preload, worktree, RPC, or model-scope subsystems.
 

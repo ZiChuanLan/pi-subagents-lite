@@ -1,5 +1,5 @@
 {
-  "name": "@lan-local/pi-subagents-lite",
+  "name": "@zichuanlan/pi-subagents-lite",
   "version": "0.1.0",
   "description": "A streamlined Pi subagent runtime with FleetView, live conversations, and JSON agent profiles.",
   "author": "Lan (fork), tintinweb (original)",
@@ -11,6 +11,9 @@
   "homepage": "https://github.com/ZiChuanLan/pi-subagents-lite#readme",
   "bugs": {
     "url": "https://github.com/ZiChuanLan/pi-subagents-lite/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "pi-package",
