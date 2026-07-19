@@ -2,7 +2,24 @@
 
 All notable changes to `@zichuanlan/pi-subagents-lite` are documented here.
 
-## [Unreleased]
+## [0.2.0] - 2026-07-20
+
+### Changed
+
+- Children are single-level by hard policy: nested `subagent` tools, Trellis/goal lifecycle tools, `todo`, `advisor`, `memory`, and `skill_manage` never surface to child sessions.
+- Explicit `tools: [...]` profiles are closed allowlists — unselected extension tools no longer auto-surface merely because extensions load.
+- `tools: none` is a closed empty allowlist (no built-ins and no extension tools without `ext:`).
+- Embedded defaults no longer inherit the parent system prompt (`promptMode: replace`), default to `isolated` + bounded `maxTurns`, and Explore/Plan/Review exclude shell.
+- Soft turn-limit steer asks for immediate evidence-only wrap-up; default grace turns reduced from 5 to 1.
+- Added embedded `Review` agent for evidence-first read-only review.
+- Added embedded `Research` agent: local read-only tools plus `pi-web-access` (`web_search` / `fetch_content` / `get_search_content`) so web lookup does not force `general-purpose`.
+- Locked a **5-agent lite roster** with explicit merge rules (`docs/AGENT_ROSTER.md`): security→Review, debug/verify→general-purpose, no OMO-scale cast.
+- `general-purpose` display name **Implement**; descriptions and prompts refuse pure search/review/docs work.
+- Documented full config pairing: `subagents.json` (policy) + `agents/*.md` (prompt bodies).
+
+### Fixed
+
+- Read-only profiles could previously inherit orchestration tools (e.g. Trellis/todo) when extensions loaded without `ext:` selectors.
 
 ## [0.1.0] - 2026-07-19
 

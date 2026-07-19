@@ -11,6 +11,16 @@ function escapeXmlAttribute(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
+const CHILD_CONTRACT = `<sub_agent_contract>
+Single-level worker rules (non-negotiable):
+- Complete only the assigned task; do not expand into a new product workflow.
+- Never dispatch, resume, or steer other agents (no nested subagents).
+- Never start/update/finish parent or Trellis task lifecycle.
+- Do not create unsolicited report files or notes.
+- Prefer tools over guessing; cite absolute paths for evidence.
+- If blocked, stop and report the blocker with what you already found.
+</sub_agent_contract>`;
+
 export function buildAgentPrompt(
   config: AgentConfig,
   cwd: string,
@@ -24,6 +34,8 @@ ${env.isGitRepo ? `Git repository: yes\nBranch: ${env.branch}` : "Not a git repo
 Platform: ${env.platform}`;
 
   if (config.promptMode === "append") {
+    // Append is an intentional parent-twin mode. Still inject the child contract
+    // so nested-agent / workflow ownership never rides along silently.
     const identity = parentSystemPrompt || genericBase;
     const bridge = `<sub_agent_context>
 You are operating as a sub-agent invoked to handle a specific task.
@@ -40,14 +52,14 @@ You are operating as a sub-agent invoked to handle a specific task.
     const custom = config.systemPrompt.trim()
       ? `\n\n<agent_instructions>\n${config.systemPrompt}\n</agent_instructions>`
       : "";
-    return `${identity}\n\n${bridge}\n\n${activeAgentTag}${envBlock}${custom}`;
+    return `${identity}\n\n${bridge}\n\n${CHILD_CONTRACT}\n\n${activeAgentTag}${envBlock}${custom}`;
   }
 
   const replaceHeader = `You are a pi coding agent sub-agent.
 You have been invoked to handle a specific task autonomously.
 
 ${envBlock}`;
-  return `${activeAgentTag}${replaceHeader}\n\n${config.systemPrompt}`;
+  return `${activeAgentTag}${replaceHeader}\n\n${config.systemPrompt}\n\n${CHILD_CONTRACT}`;
 }
 
 const genericBase = `# Role

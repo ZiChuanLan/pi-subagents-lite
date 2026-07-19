@@ -36,8 +36,24 @@ export const SUBAGENT_TOOL_NAMES = {
   STEER: "steer_subagent",
 } as const;
 
-/** Names of tools registered by this extension that subagents must NOT inherit. */
-const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
+/**
+ * Tools children must never inherit — nesting, parent workflow ownership, and
+ * interactive control-plane tools. Configuration cannot re-enable these names.
+ */
+export const CHILD_HARD_DENIED_TOOLS: readonly string[] = [
+  ...Object.values(SUBAGENT_TOOL_NAMES),
+  "trellis_subagent",
+  "advisor",
+  "todo",
+  "goal_complete",
+  "goal_blocked",
+  "ask_user_question",
+  "memory",
+  "skill_manage",
+];
+
+/** @deprecated Use CHILD_HARD_DENIED_TOOLS; kept for existing test imports. */
+const EXCLUDED_TOOL_NAMES: string[] = [...CHILD_HARD_DENIED_TOOLS];
 
 /**
  * Canonical name of an extension for `extensions: [...]` allowlist matching.
@@ -210,7 +226,7 @@ export function getDefaultMaxTurns(): number | undefined { return defaultMaxTurn
 export function setDefaultMaxTurns(n: number | undefined): void { defaultMaxTurns = normalizeMaxTurns(n); }
 
 /** Additional turns allowed after the soft limit steer message. */
-let graceTurns = 5;
+let graceTurns = 1;
 
 /** Get the grace turns value. */
 export function getGraceTurns(): number { return graceTurns; }
@@ -587,15 +603,18 @@ export async function runAgent(
   // Extensions populate `extension.tools` during `loader.reload()` and the set
   // is stable afterwards — `bindExtensions` does not register new tools.
   //
-  // Opt-in flip: when any `ext:` selector is present, extension tools become an
-  // explicit allowlist — a loaded extension not named by a selector contributes
-  // no tools (its handlers still ran), and `ext:foo/bar` narrows `foo` to `bar`.
+  // Explicit tools policy (`tools: [...]` or `tools: none`) is opt-in only:
+  // unselected extension tools never surface, even when those extensions load
+  // for handlers/side effects. Legacy omission / `tools: all` still exposes all
+  // loaded extension tools (minus hard denials).
+  const toolsPolicy = agentConfig?.toolsPolicy;
+  const extensionToolsOptIn =
+    toolsPolicy === "explicit" || toolsPolicy === "none" || extNames.size > 0;
   const extensionToolNames: string[] = [];
   if (!noExtensions) {
-    const optInActive = extNames.size > 0;
     for (const extension of loader.getExtensions().extensions) {
       const canons = extensionCanonicalNames(extension.path);
-      if (optInActive && !canons.some((c) => extNames.has(c))) continue;
+      if (extensionToolsOptIn && !canons.some((c) => extNames.has(c))) continue;
       // First alias that carries a narrowing set — a user won't narrow one
       // extension under two different names, so first-match is correct.
       const narrowed = canons.map((c) => narrowing.get(c)).find(Boolean);
@@ -610,14 +629,13 @@ export async function runAgent(
   // pi-mono's `allowedToolNames` gates BOTH registration and the initial active
   // set, so listing the exact final set here means the session is correctly
   // scoped from the first instant — no post-construction narrowing required.
+  const hardDenied = new Set(CHILD_HARD_DENIED_TOOLS);
   const builtinToolNameSet = new Set(toolNames);
   const allowedTools = [...toolNames, ...extensionToolNames].filter((t) => {
-    if (EXCLUDED_TOOL_NAMES.includes(t)) return false;
+    if (hardDenied.has(t) || EXCLUDED_TOOL_NAMES.includes(t)) return false;
     if (disallowedSet?.has(t)) return false;
     if (builtinToolNameSet.has(t)) return true;
-    // Reached only for extension tools. The extension set was already filtered
-    // at the loader (extensionsOverride / noExtensions) and at enumeration
-    // (`ext:` opt-in flip), so any extension tool in `extensionToolNames` is allowed.
+    // Extension tools only — already filtered by loader + toolsPolicy opt-in.
     return !noExtensions;
   });
 
@@ -685,7 +703,9 @@ export async function runAgent(
       if (maxTurns != null) {
         if (!softLimitReached && turnCount >= maxTurns) {
           softLimitReached = true;
-          session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+          session.steer(
+            "Turn budget reached. Stop using tools. Return the evidence and conclusion you already have now; do not start a new plan or spawn work.",
+          );
         } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
           aborted = true;
           session.abort();

@@ -6,10 +6,12 @@ import type { LifetimeUsage } from "./usage.js";
 
 export type { ThinkingLevel };
 export type SubagentType = string;
-export const DEFAULT_AGENT_NAMES = ["general-purpose", "Explore", "Plan"] as const;
+export const DEFAULT_AGENT_NAMES = ["general-purpose", "Explore", "Research", "Plan", "Review"] as const;
 
 export type AgentExtensions = true | string[] | false;
 export type AgentTools = string[] | "all" | "none";
+/** How the profile selected tools. Explicit arrays never auto-include unselected extension tools. */
+export type ToolsPolicy = "all" | "none" | "explicit";
 
 /** Sanitized JSON profile. All fields are optional so profiles can override defaults field-by-field. */
 export interface AgentProfile {
@@ -37,6 +39,12 @@ export interface AgentConfig {
   builtinToolNames?: string[];
   /** Raw extension selectors from tools, e.g. ext:mcp or ext:mcp/search. */
   extSelectors?: string[];
+  /**
+   * Retained from the profile `tools` field so runtime can distinguish:
+   * - omitted: legacy “all loaded extension tools” behavior when extensions load
+   * - all / none / explicit array
+   */
+  toolsPolicy?: ToolsPolicy;
   disallowedTools?: string[];
   extensions: AgentExtensions;
   excludeExtensions?: string[];

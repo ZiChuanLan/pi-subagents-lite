@@ -73,6 +73,16 @@ This fork includes two compatibility behaviors inspired by the gotgenes fork lin
 2. After child extensions bind, active tools are reduced to the intersection of the post-policy active set and the agent allowlist. The package never restores the full allowlist after policy binding.
 3. Disabled agent profiles are non-runnable, agent identity attributes are XML-escaped, and session switches discard old child runtimes before activating a replacement session.
 
+### Single-level efficiency policy (this fork)
+
+Children are hard-limited to single-level work:
+
+1. Nested delegation tools and parent workflow tools are hard-denied and cannot be re-enabled by profile configuration.
+2. Explicit `tools: [...]` profiles are closed allowlists; unselected extension tools do not auto-surface when extensions load.
+3. Embedded defaults use `promptMode: replace`, prefer `isolated`, bound `maxTurns`, and keep Explore/Plan/Review without shell/write tools.
+4. Soft turn-limit steering demands immediate evidence-only wrap-up with a 1-turn grace default.
+5. Role split: `Explore` is local-only; `Research` adds `pi-web-access` web tools; `general-purpose` is reserved for mutation/shell so pure lookup does not force a full agent.
+
 The package also retains a minimal `Symbol.for("pi-subagents:manager")` bridge for Pi's print/headless lifecycle. It exposes only:
 
 - `waitForAll`

@@ -28,9 +28,14 @@ describe("buildAgentPrompt", () => {
     expect(prompt).not.toContain("Branch:");
   });
 
-  it("keeps embedded Explore and Plan prompts read-only", () => {
-    expect(buildAgentPrompt(defaultConfig("Explore"), "/workspace", gitEnv)).toContain("READ-ONLY");
-    expect(buildAgentPrompt(defaultConfig("Plan"), "/workspace", gitEnv)).toContain("software architect");
+  it("keeps embedded Explore, Plan, and Review prompts read-only and single-level", () => {
+    const explore = buildAgentPrompt(defaultConfig("Explore"), "/workspace", gitEnv);
+    expect(explore).toMatch(/local codebase recon|LOCAL/i);
+    expect(explore).toContain("<sub_agent_contract>");
+    expect(explore).toMatch(/Never dispatch|never dispatch/i);
+    expect(buildAgentPrompt(defaultConfig("Plan"), "/workspace", gitEnv)).toMatch(/read-only design|implementation plan/i);
+    expect(buildAgentPrompt(defaultConfig("Review"), "/workspace", gitEnv)).toMatch(/read-only audit|Findings/i);
+    expect(buildAgentPrompt(defaultConfig("Research"), "/workspace", gitEnv)).toMatch(/web_search|docs/i);
   });
 
   it("append mode preserves the parent prompt and adds the child bridge", () => {
@@ -47,7 +52,7 @@ describe("buildAgentPrompt", () => {
     expect(prompt).toContain("<agent_instructions>\nReview carefully.\n</agent_instructions>");
   });
 
-  it("append mode with an empty body is a parent twin", () => {
+  it("append mode with an empty body is a parent twin but still gets the child contract", () => {
     const config: AgentConfig = {
       name: "general-purpose",
       description: "Agent",
@@ -58,12 +63,19 @@ describe("buildAgentPrompt", () => {
     const prompt = buildAgentPrompt(config, "/workspace", gitEnv, "Parent prompt.");
     expect(prompt.startsWith("Parent prompt.")).toBe(true);
     expect(prompt).not.toContain("<agent_instructions>");
+    expect(prompt).toContain("<sub_agent_contract>");
   });
 
-  it("append mode falls back to a generic parent prompt", () => {
-    const prompt = buildAgentPrompt(defaultConfig("general-purpose"), "/workspace", gitEnv);
-    expect(prompt).toContain("general-purpose coding agent");
-    expect(prompt).toContain("<sub_agent_context>");
+  it("default general-purpose is replace mode and does not inherit parent identity", () => {
+    const prompt = buildAgentPrompt(
+      defaultConfig("general-purpose"),
+      "/workspace",
+      gitEnv,
+      "SECRET PARENT WORKFLOW",
+    );
+    expect(prompt).not.toContain("SECRET PARENT WORKFLOW");
+    expect(prompt).toContain("<sub_agent_contract>");
+    expect(prompt).toMatch(/single-level/i);
   });
 
   it("replace mode ignores parent identity and uses the prompt body", () => {

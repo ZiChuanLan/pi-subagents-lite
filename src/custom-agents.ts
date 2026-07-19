@@ -93,6 +93,7 @@ function applyProfile(config: AgentConfig, profile: AgentProfile | undefined): A
     const tools = partitionTools(profile.tools);
     next.builtinToolNames = tools.builtinToolNames;
     next.extSelectors = tools.extSelectors;
+    next.toolsPolicy = tools.toolsPolicy;
   }
   if (profile.enabled !== undefined) next.enabled = profile.enabled;
   if (profile.promptMode !== undefined) next.promptMode = profile.promptMode;
@@ -109,15 +110,23 @@ function applyProfile(config: AgentConfig, profile: AgentProfile | undefined): A
 function partitionTools(tools: AgentTools): {
   builtinToolNames: string[] | undefined;
   extSelectors: string[] | undefined;
+  toolsPolicy: "all" | "none" | "explicit";
 } {
-  if (tools === "all") return { builtinToolNames: undefined, extSelectors: undefined };
-  if (tools === "none") return { builtinToolNames: [], extSelectors: undefined };
+  if (tools === "all") {
+    return { builtinToolNames: undefined, extSelectors: undefined, toolsPolicy: "all" };
+  }
+  if (tools === "none") {
+    return { builtinToolNames: [], extSelectors: undefined, toolsPolicy: "none" };
+  }
   const wildcard = tools.some((item) => item === "*" || item.toLowerCase() === "all");
   const extSelectors = tools.filter((item) => item.startsWith("ext:"));
   const plain = tools.filter((item) => item !== "*" && item.toLowerCase() !== "all" && !item.startsWith("ext:"));
+  // `*` / `all` in an array means open built-ins (+ all loaded extension tools unless
+  // narrowed by ext:). A plain list is closed: only named built-ins and named ext: tools.
   return {
     builtinToolNames: wildcard ? [...new Set([...BUILTIN_TOOL_NAMES, ...plain])] : plain,
     extSelectors: extSelectors.length > 0 ? extSelectors : undefined,
+    toolsPolicy: wildcard ? "all" : "explicit",
   };
 }
 
@@ -141,6 +150,7 @@ function parseLegacyFrontmatter(frontmatter: Record<string, unknown>): Partial<A
   if (tools !== undefined) {
     config.builtinToolNames = tools.builtinToolNames;
     config.extSelectors = tools.extSelectors;
+    config.toolsPolicy = tools.toolsPolicy;
   }
   if (extensions !== undefined) config.extensions = extensions;
   if (excludeExtensions !== undefined) config.excludeExtensions = excludeExtensions;
@@ -177,10 +187,11 @@ function stringList(value: unknown): string[] | undefined {
 function legacyTools(value: unknown): {
   builtinToolNames: string[] | undefined;
   extSelectors: string[] | undefined;
+  toolsPolicy: "all" | "none" | "explicit";
 } | undefined {
   if (value == null) return undefined;
   if (typeof value === "string" && value.trim().toLowerCase() === "none") {
-    return { builtinToolNames: [], extSelectors: undefined };
+    return { builtinToolNames: [], extSelectors: undefined, toolsPolicy: "none" };
   }
   return partitionTools(stringList(value) ?? []);
 }

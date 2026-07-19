@@ -211,9 +211,9 @@ Extension tools use selectors:
 
 - `ext:mcp` exposes all tools registered by the `mcp` extension.
 - `ext:mcp/search` exposes only the `search` tool from `mcp`.
-- `"*"` inside an array means all built-in tools.
+- `"*"` inside an array means all built-in tools **and** (unless narrowed by `ext:`) all tools from loaded extensions.
 
-Once any `ext:` selector is present, extension tools become opt-in: loaded extensions not named by a selector contribute no tools. `extensions` controls loading; `tools` controls what reaches the child model.
+An explicit array without `*` is closed: only the listed built-ins and listed `ext:` tools reach the child. `extensions` controls loading/handlers; `tools` controls what reaches the child model.
 
 ## Prompt Markdown
 
@@ -237,15 +237,39 @@ The filename is the agent name. A Markdown file can override an embedded prompt 
 
 Legacy YAML frontmatter from the upstream package is still parsed as a migration fallback, but new configuration should use `subagents.json`. When both are present, JSON profile fields win and the Markdown body remains the prompt.
 
-## Built-in agents
+## Built-in agents (lite roster)
 
-| Type | Prompt mode | Default tools | Intended use |
-| --- | --- | --- | --- |
-| `general-purpose` | `append` | All built-ins | Parent-prompt twin for multi-step work |
-| `Explore` | `replace` | Read-only set | Fast codebase discovery |
-| `Plan` | `replace` | Read-only set | Architecture and implementation planning |
+Split **only** when tool/write boundaries differ. Checklists (security, debug, verify) merge into prompts — see [`docs/AGENT_ROSTER.md`](docs/AGENT_ROSTER.md).
 
-Create a JSON profile with the same name to override runtime fields. Create a Markdown file with the same name to override its prompt body. Set `enabled: false` in JSON to disable it.
+| Type | Display | Tools | Turns | Use when |
+| --- | --- | --- | --- | --- |
+| `Explore` | Explore | `read/grep/find/ls` | ~8 | Local files/symbols/paths only |
+| `Research` | Research | local read-only + `web_search`/`fetch_content`/`get_search_content` | ~10 | Docs, versions, external APIs, OSS samples |
+| `Plan` | Plan | read-only (+ optional pi-lens via JSON) | ~12 | Implementation design, not coding |
+| `Review` | Review | `read/grep/find/ls` | ~10 | Correctness + security findings |
+| `general-purpose` | **Implement** | all built-ins, isolated | ~14 | **Only** write/edit/shell for one task |
+
+**Dispatch:** locate → `Explore` · docs/web → `Research` · design → `Plan` · audit → `Review` · mutate → `general-purpose`.
+
+**Do not** default every task to `general-purpose`. Debug/verify/security are **not** separate agents in lite; they are phases/checklists inside Implement or Review.
+
+### Config + docs you should keep in sync
+
+| Layer | Path | Owns |
+| --- | --- | --- |
+| Runtime policy | `~/.pi/agent/subagents.json` or `<cwd>/.pi/subagents.json` | tools, extensions, model, maxTurns, isolated |
+| Prompt body | `~/.pi/agent/agents/<Name>.md` or project `.pi/agents/` | persona, checklists, output shape |
+| Merge rules | `docs/AGENT_ROSTER.md` | what to split vs merge |
+
+Create a JSON profile with the same name to override runtime fields. Create a Markdown file with the same name to override the prompt body. Set `enabled: false` in JSON to disable a type.
+
+### Single-level efficiency rules
+
+- Children never inherit nested-agent tools (`subagent`, `get_subagent_result`, `steer_subagent`) or parent workflow tools (`trellis_subagent`, `todo`, `advisor`, goal tools, `memory`, `skill_manage`).
+- An explicit `tools: [...]` list is a **closed** allowlist: only named built-ins and `ext:<extension>/<tool>` selectors surface. Loading an extension for handlers does not auto-expose its tools.
+- `tools: none` exposes no tools. `tools: "*"` / `tools: "all"` is the open policy for all built-ins plus loaded extension tools (minus hard denials).
+- Defaults use `promptMode: replace` and do not inherit the parent conversation unless `inherit_context` is set per call.
+- Soft turn-limit wrap-up asks for current evidence immediately; default grace is 1 turn.
 
 ## Permission compatibility
 

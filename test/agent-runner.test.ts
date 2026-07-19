@@ -746,12 +746,25 @@ describe("agent-runner master tool allowlist", () => {
     expect(tools).toContain("read");
   });
 
-  it("EXCLUDED_TOOL_NAMES never reach the allowlist even if an extension registers them", async () => {
+  it("CHILD_HARD_DENIED tools never reach the allowlist even if an extension registers them", async () => {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true }));
     vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
     withExtensions({
-      "/ext/evil.ts": ["subagent", "get_subagent_result", "steer_subagent", "ok_ext"],
+      "/ext/evil.ts": [
+        "subagent",
+        "get_subagent_result",
+        "steer_subagent",
+        "trellis_subagent",
+        "advisor",
+        "todo",
+        "goal_complete",
+        "goal_blocked",
+        "ask_user_question",
+        "memory",
+        "skill_manage",
+        "ok_ext",
+      ],
     });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
@@ -759,10 +772,77 @@ describe("agent-runner master tool allowlist", () => {
     await runAgent(ctx, "Explore", "go", { pi });
 
     const tools = lastToolsPassed();
-    expect(tools).not.toContain("subagent");
-    expect(tools).not.toContain("get_subagent_result");
-    expect(tools).not.toContain("steer_subagent");
+    for (const denied of [
+      "subagent",
+      "get_subagent_result",
+      "steer_subagent",
+      "trellis_subagent",
+      "advisor",
+      "todo",
+      "goal_complete",
+      "goal_blocked",
+      "ask_user_question",
+      "memory",
+      "skill_manage",
+    ]) {
+      expect(tools).not.toContain(denied);
+    }
     expect(tools).toContain("ok_ext");
+  });
+
+  it("explicit tools arrays do not auto-include unselected extension tools", async () => {
+    // Regression: Explore-style profiles with tools: [read,grep,find,ls] must not
+    // inherit trellis/orchestration tools merely because extensions load.
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({
+        extensions: true,
+        toolsPolicy: "explicit",
+        builtinToolNames: ["read", "grep", "find", "ls"],
+        extSelectors: undefined,
+      }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read", "grep", "find", "ls"]);
+    withExtensions({
+      "/ext/trellis.ts": ["trellis_subagent", "todo", "advisor"],
+      "/ext/mcp.ts": ["mcp_search"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    const tools = lastToolsPassed();
+    expect(tools).toEqual(["read", "grep", "find", "ls"]);
+    expect(tools).not.toContain("mcp_search");
+    expect(tools).not.toContain("trellis_subagent");
+    expect(tools).not.toContain("todo");
+    expect(tools).not.toContain("advisor");
+  });
+
+  it("explicit tools may opt into extension tools only via ext: selectors", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: ["pi-lens"] }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({
+        extensions: ["pi-lens"],
+        toolsPolicy: "explicit",
+        builtinToolNames: ["read", "grep"],
+        extSelectors: ["ext:pi-lens/symbol_search"],
+      }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read", "grep"]);
+    withExtensions({
+      "/ext/pi-lens/index.ts": ["symbol_search", "module_report", "todo"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Plan", "go", { pi });
+
+    const tools = lastToolsPassed();
+    expect(tools).toEqual(["read", "grep", "symbol_search"]);
+    expect(tools).not.toContain("module_report");
+    expect(tools).not.toContain("todo");
   });
 
   it("extensions: false with disallowedTools — denylist applies to built-ins", async () => {

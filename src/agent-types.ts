@@ -89,8 +89,9 @@ export function getConfig(type: string): {
     displayName: fallback?.displayName ?? "Agent",
     description: fallback?.description ?? "General-purpose agent for complex, multi-step tasks",
     builtinToolNames: fallback?.builtinToolNames ?? BUILTIN_TOOL_NAMES,
-    extensions: fallback?.extensions ?? true,
+    // Safer child default: no parent extension surface unless the profile opts in.
+    extensions: fallback?.extensions ?? false,
     excludeExtensions: fallback?.excludeExtensions,
-    promptMode: fallback?.promptMode ?? "append",
+    promptMode: fallback?.promptMode ?? "replace",
   };
 }

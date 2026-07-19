@@ -29,9 +29,22 @@ function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
 describe("agent type registry", () => {
   beforeEach(() => registerAgents(new Map()));
 
-  it("registers the three embedded defaults", () => {
-    expect(getAvailableTypes()).toEqual(["general-purpose", "Explore", "Plan"]);
-    expect(getDefaultAgentNames()).toEqual(["general-purpose", "Explore", "Plan"]);
+  it("registers the five embedded defaults in lite order", () => {
+    expect(getAvailableTypes()).toEqual([
+      "general-purpose",
+      "Explore",
+      "Research",
+      "Plan",
+      "Review",
+    ]);
+    expect(getDefaultAgentNames()).toEqual([
+      "general-purpose",
+      "Explore",
+      "Research",
+      "Plan",
+      "Review",
+    ]);
+    expect(getAgentConfig("general-purpose")?.displayName).toBe("Implement");
   });
 
   it("resolves agent names case-insensitively", () => {
@@ -40,30 +53,53 @@ describe("agent type registry", () => {
     expect(resolveType("missing")).toBeUndefined();
   });
 
-  it("keeps Explore and Plan read-only", () => {
-    for (const name of ["Explore", "Plan"]) {
+  it("keeps Explore, Plan, and Review truly read-only without shell", () => {
+    for (const name of ["Explore", "Plan", "Review"]) {
       const tools = getToolNamesForType(name);
-      expect(tools).toEqual(["read", "bash", "grep", "find", "ls"]);
+      expect(tools).toEqual(["read", "grep", "find", "ls"]);
+      expect(tools).not.toContain("bash");
       expect(tools).not.toContain("edit");
       expect(tools).not.toContain("write");
+      const config = getAgentConfig(name);
+      expect(config?.toolsPolicy).toBe("explicit");
+      expect(config?.isolated).toBe(true);
+      expect(config?.inheritContext).toBe(false);
+      expect(config?.extensions).toBe(false);
     }
   });
 
-  it("does not lock call-site strategy fields on defaults", () => {
-    for (const name of ["general-purpose", "Explore", "Plan"]) {
-      const config = getAgentConfig(name);
-      expect(config?.runInBackground).toBeUndefined();
-      expect(config?.inheritContext).toBeUndefined();
-      expect(config?.isolated).toBeUndefined();
-    }
+  it("Research is read-only local tools plus web-access selectors", () => {
+    const config = getAgentConfig("Research");
+    expect(getToolNamesForType("Research")).toEqual(["read", "grep", "find", "ls"]);
+    expect(config?.toolsPolicy).toBe("explicit");
+    expect(config?.isolated).toBe(false);
+    expect(config?.extensions).toEqual(["pi-web-access"]);
+    expect(config?.extSelectors).toEqual([
+      "ext:pi-web-access/web_search",
+      "ext:pi-web-access/fetch_content",
+      "ext:pi-web-access/get_search_content",
+    ]);
+    expect(config?.maxTurns).toBe(10);
+  });
+
+  it("bounds default agents so they stay single-level workers", () => {
+    const general = getAgentConfig("general-purpose");
+    expect(general?.promptMode).toBe("replace");
+    expect(general?.isolated).toBe(true);
+    expect(general?.inheritContext).toBe(false);
+    expect(general?.extensions).toBe(false);
+    expect(general?.maxTurns).toBe(14);
+    expect(getAgentConfig("Explore")?.maxTurns).toBe(8);
+    expect(getAgentConfig("Plan")?.maxTurns).toBe(12);
+    expect(getAgentConfig("Review")?.maxTurns).toBe(10);
   });
 
   it("returns the general-purpose fallback config for unknown names", () => {
     const config = getConfig("missing");
-    expect(config.displayName).toBe("Agent");
+    expect(config.displayName).toBe("Implement");
     expect(config.description).toBe(DEFAULT_AGENTS.get("general-purpose")?.description);
     expect(config.builtinToolNames).toEqual(BUILTIN_TOOL_NAMES);
-    expect(config.promptMode).toBe("append");
+    expect(config.promptMode).toBe("replace");
   });
 
   it("registers user agents alongside defaults", () => {

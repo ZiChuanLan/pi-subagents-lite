@@ -144,7 +144,7 @@ Keep this persona.`);
       isDefault: true,
       source: "json",
     });
-    expect(explore?.systemPrompt).toContain("READ-ONLY MODE");
+    expect(explore?.systemPrompt).toMatch(/local codebase recon|Explore|read-only/i);
   });
 
   it("JSON may define a custom agent with an empty prompt", () => {
@@ -159,6 +159,7 @@ Keep this persona.`);
       enabled: true,
       source: "json",
       builtinToolNames: [],
+      toolsPolicy: "none",
     });
   });
 
@@ -169,8 +170,11 @@ Keep this persona.`);
       narrow: { tools: ["read", "grep"] },
     });
     expect(agents.get("all")?.builtinToolNames).toBeUndefined();
+    expect(agents.get("all")?.toolsPolicy).toBe("all");
     expect(agents.get("none")?.builtinToolNames).toEqual([]);
+    expect(agents.get("none")?.toolsPolicy).toBe("none");
     expect(agents.get("narrow")?.builtinToolNames).toEqual(["read", "grep"]);
+    expect(agents.get("narrow")?.toolsPolicy).toBe("explicit");
   });
 
   it("legacy tools all maps to all built-ins and ext selectors are ignored", () => {

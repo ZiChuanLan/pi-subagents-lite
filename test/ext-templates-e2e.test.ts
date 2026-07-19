@@ -151,7 +151,9 @@ describe("ext: / tools: scoping — template-driven e2e (real pi-mono, headless)
 
     for (const s of SCENARIOS) {
       // Each declares at least one expectation, so no scenario is a no-op.
-      expect(s.present.length + s.promptContains.length + s.promptAbsent.length).toBeGreaterThan(0);
+      expect(
+        s.present.length + s.absent.length + s.promptContains.length + s.promptAbsent.length,
+      ).toBeGreaterThan(0);
       // Each loaded as ITS OWN agent — guards against runAgent silently falling
       // back to general-purpose when a template fails to parse/register.
       const cfg = getAgentConfig(s.name);

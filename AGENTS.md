@@ -4,6 +4,8 @@
 
 `@zichuanlan/pi-subagents-lite` is a balanced-lite fork. Keep execution and observability; do not casually restore removed subsystems.
 
+Default roster is **five** agents (Explore, Research, Plan, Review, general-purpose/Implement). Add agents only when the **tool or write boundary** differs — see `docs/AGENT_ROSTER.md`. Do not grow an OMO-sized cast by default.
+
 Retained: foreground/background execution, queues, FleetView, live conversation viewer, steer/stop/resume, notifications, context inheritance, transcripts, custom agents, and observation events.
 
 Removed: scheduler, persistent agent memory, dedicated skill preloading, worktree isolation, cross-extension spawn/stop RPC, and model-scope enforcement.

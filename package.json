@@ -1,6 +1,6 @@
 {
   "name": "@zichuanlan/pi-subagents-lite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A streamlined Pi subagent runtime with FleetView, live conversations, and JSON agent profiles.",
   "author": "Lan (fork), tintinweb (original)",
   "license": "MIT",
@@ -25,6 +25,7 @@
   ],
   "files": [
     "src",
+    "docs",
     "README.md",
     "FORK_NOTES.md",
     "CHANGELOG.md",
