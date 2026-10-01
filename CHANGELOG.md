@@ -2,6 +2,16 @@
 
 All notable changes to `@zichuanlan/pi-subagents-lite` are documented here.
 
+## [0.2.1] - 2026-10-01
+
+### Fixed
+
+- Move `@sinclair/typebox` from `dependencies` to `peerDependencies` (`"*"`). Pi ships TypeBox itself and its extension loader aliases the specifier to that host copy, so a runtime dependency duplicated a host-provided module and made Pi print `Warning: Extension package "…": Host-provided extension packages must be declared in peerDependencies with a "*" range, not dependencies: @sinclair/typebox.` at every startup. Runtime behavior is unchanged — the extension already resolved to the host copy — but the manifest now matches Pi's package contract.
+
+### Internal
+
+- CI triggers on `main`, the branch this fork uses, instead of the inherited upstream `master` (the workflow had never run).
+
 ## [0.2.0] - 2026-07-20
 
 ### Changed

@@ -1,6 +1,6 @@
 {
   "name": "@zichuanlan/pi-subagents-lite",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A streamlined Pi subagent runtime with FleetView, live conversations, and JSON agent profiles.",
   "author": "Lan (fork), tintinweb (original)",
   "license": "MIT",
@@ -34,10 +34,8 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.80.0",
     "@earendil-works/pi-coding-agent": ">=0.80.0",
-    "@earendil-works/pi-tui": ">=0.80.0"
-  },
-  "dependencies": {
-    "@sinclair/typebox": "^0.34.49"
+    "@earendil-works/pi-tui": ">=0.80.0",
+    "@sinclair/typebox": "*"
   },
   "scripts": {
     "build": "tsc",
