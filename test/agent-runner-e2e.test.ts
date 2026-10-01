@@ -36,8 +36,12 @@ import { registerFauxProvider } from "./helpers/pi-ai.js";
 // These tests spin up the REAL pi-mono runtime (loader + dynamic extension
 // import + session construction), so a cold first run under full-suite CPU
 // contention can exceed vitest's 5s default. Give the file generous headroom —
-// a genuine hang still fails, just later.
-vi.setConfig({ testTimeout: 30_000 });
+// a genuine hang still fails, just later. The first session in this file pays
+// the whole cold-import cost for the real runtime, measured at ~25s on a
+// WSL/ext4 box (2026-10-01), and that cost grew past the old 30s budget when
+// the suite ran concurrently with itself; the budget is 2x the observed cost
+// rather than sitting on the edge.
+vi.setConfig({ testTimeout: 60_000 });
 
 const FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-probe-ext.mjs", import.meta.url)));
 /** The fixture registers exactly this tool. */
